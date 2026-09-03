@@ -281,7 +281,7 @@ y0       = sum(pva0[i]*xd0[i] - depr[i]*k0[i] for i in SEC)  # Private GDP at ba
 # =============================================================================
 
 function cammodel()
-    cgecam = Model(with_optimizer(Ipopt.Optimizer))
+    cgecam = Model(Ipopt.Optimizer)
 
     # -------------------------------------------------------------------------
     # DECISION VARIABLES  (all strictly positive via lower bound 1e-6)
@@ -498,26 +498,26 @@ function cammodel()
     mps      = JuMP.value.(mps);      hhsav    = JuMP.value.(hhsav)
     govsav   = JuMP.value.(govsav);   deprecia = JuMP.value.(deprecia)
     savings  = JuMP.value.(savings);  fsav     = JuMP.value.(fsav)
-    dk       = JuMP.value.(dk)
+    dk       = JuMP.value.(dk);       omega    = JuMP.value.(omega)
 
     return pd, pm, pe, pk, px, p, pva, pwm, pwe, tm,
            x, xd, xxd, e, m, k, wa, ls, labd,
-           int, gd, id, dst, y, gr, tariff, indtax, duty, gdtot,
-           mps, hhsav, govsav, deprecia, savings, fsav, dk
+           int, cd, gd, id, dst, y, gr, tariff, indtax, duty, gdtot,
+           mps, hhsav, govsav, deprecia, savings, fsav, dk, omega
 end
 
 # =============================================================================
 # RESULTS CONTAINER
-# Bundles all 36 endogenous variable arrays for one model run.
+# Bundles all 38 endogenous variable arrays for one model run.
 # Any is used because JuMP.value.() returns non-standard DenseAxisArray types.
 # =============================================================================
 
 struct Simulation
     pd::Any; pm::Any; pe::Any; pk::Any; px::Any; p::Any; pva::Any
     pwm::Any; pwe::Any; tm::Any; x::Any; xd::Any; xxd::Any; e::Any; m::Any
-    k::Any; wa::Any; ls::Any; labd::Any; int::Any; gd::Any; id::Any; dst::Any
+    k::Any; wa::Any; ls::Any; labd::Any; int::Any; cd::Any; gd::Any; id::Any; dst::Any
     y::Any; gr::Any; tariff::Any; indtax::Any; duty::Any; gdtot::Any; mps::Any
-    hhsav::Any; govsav::Any; deprecia::Any; savings::Any; fsav::Any; dk::Any
+    hhsav::Any; govsav::Any; deprecia::Any; savings::Any; fsav::Any; dk::Any; omega::Any
 end
 
 # =============================================================================
@@ -527,13 +527,13 @@ end
 
 pd, pm, pe, pk, px, p, pva, pwm, pwe, tm,
 x, xd, xxd, e, m, k, wa, ls, labd,
-int, gd, id, dst, y, gr, tariff, indtax, duty, gdtot,
-mps, hhsav, govsav, deprecia, savings, fsav, dk = cammodel()
+int, cd, gd, id, dst, y, gr, tariff, indtax, duty, gdtot,
+mps, hhsav, govsav, deprecia, savings, fsav, dk, omega = cammodel()
 
 baseline = Simulation(pd, pm, pe, pk, px, p, pva, pwm, pwe, tm,
                       x, xd, xxd, e, m, k, wa, ls, labd,
-                      int, gd, id, dst, y, gr, tariff, indtax, duty, gdtot,
-                      mps, hhsav, govsav, deprecia, savings, fsav, dk)
+                      int, cd, gd, id, dst, y, gr, tariff, indtax, duty, gdtot,
+                      mps, hhsav, govsav, deprecia, savings, fsav, dk, omega)
 
 # =============================================================================
 # SIMULATION 1 — Agricultural Capital Shock
@@ -547,10 +547,10 @@ k0[:agsubsist] = 1.10 * k0[:agsubsist]
 
 pd, pm, pe, pk, px, p, pva, pwm, pwe, tm,
 x, xd, xxd, e, m, k, wa, ls, labd,
-int, gd, id, dst, y, gr, tariff, indtax, duty, gdtot,
-mps, hhsav, govsav, deprecia, savings, fsav, dk = cammodel()
+int, cd, gd, id, dst, y, gr, tariff, indtax, duty, gdtot,
+mps, hhsav, govsav, deprecia, savings, fsav, dk, omega = cammodel()
 
 sim1 = Simulation(pd, pm, pe, pk, px, p, pva, pwm, pwe, tm,
                   x, xd, xxd, e, m, k, wa, ls, labd,
-                  int, gd, id, dst, y, gr, tariff, indtax, duty, gdtot,
-                  mps, hhsav, govsav, deprecia, savings, fsav, dk)
+                  int, cd, gd, id, dst, y, gr, tariff, indtax, duty, gdtot,
+                  mps, hhsav, govsav, deprecia, savings, fsav, dk, omega)
