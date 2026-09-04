@@ -2,7 +2,7 @@
 #
 # Run with:  julia --project=. test/runtests.jl   (from the repo root)
 #
-# Two checks:
+# Three checks:
 #  1. The baseline solve reproduces the base-year calibration data (`xd0`, `k0`, `y0`,
 #     ...) to within Ipopt's own "acceptable level" solver tolerance -- this is the
 #     standard "does the model calibrate" check for this kind of CGE.
@@ -11,7 +11,11 @@
 #     field of the ORIGINAL, pre-refactor script's `baseline` and `sim1` -- to 1e-6
 #     relative on every value. This is the regression guard for the refactor itself:
 #     it proves the module reproduces the original script bit-for-bit (the observed
-#     difference at the time of writing is exactly 0.0).
+#     difference at the time of writing is exactly 0.0). Both of these solve cold (no
+#     `start`), exactly as the original script did.
+#  3. A reduced robustness testset (see test/robustness_grid.jl for the full ~60-scenario
+#     grid) confirms `solve`'s `start` keyword fixes the exact cold-start
+#     `LOCALLY_INFEASIBLE` cases a prior exploration found (e.g. +5pp tariff on services).
 
 using Test
 using JuMP
@@ -145,5 +149,35 @@ const REFERENCE = parse_json_numeric(read(joinpath(@__DIR__, "reference.json"), 
         base_after, = CGECameroon.solve(params)
         @test base_before.y == base_after.y
         @test base_before.gr == base_after.gr
+    end
+
+    # A reduced version (~5 scenarios, well under 20s) of test/robustness_grid.jl's ~60-scenario
+    # grid -- see that file's header comment for the full exploration. A cold solve of a shocked
+    # Params (every variable starting from the base-year `*0` data, regardless of the shock) can
+    # return Ipopt's LOCALLY_INFEASIBLE even though the shocked equations are, in fact,
+    # satisfiable: e.g. a +5pp import tariff on services, agexpind, or indalim. Warm-starting
+    # from a previously-solved Simulation (`solve(...; start = baseline)`) fixes this reliably
+    # (see cge.jl's `solve` docstring) -- this testset checks that fix directly against the
+    # exact cases the original bug report found, plus one control sector (bienscons) that
+    # converges even cold.
+    @testset "robustness (warm-start fixes the LOCALLY_INFEASIBLE bug report cases)" begin
+        include(joinpath(@__DIR__, "robustness_grid.jl"))  # build_grid, run_grid, GridRow (reuses CGECameroon)
+
+        baseline_r, _, baseline_r_converged, = CGECameroon.solve(params)
+        @test baseline_r_converged
+
+        reduced = Tuple{String,Dict{Symbol,Any}}[
+            ("tariff +5pp $sec", Dict{Symbol,Any}(:tm0 => Dict(sec => params.tm0[sec] + 0.05)))
+            for sec in (:services, :agexpind, :indalim, :bienscons)
+        ]
+        push!(reduced, ("foreign savings +50%", Dict{Symbol,Any}(:fsav0 => params.fsav0 * 1.50)))
+
+        rows = run_grid(params, baseline_r, reduced; homotopy_steps = 4)
+        for r in rows
+            @test r.warm_converged
+        end
+        # services/agexpind/indalim must reproduce the original cold-start bug (bienscons and
+        # foreign savings converge even cold, so this counts only the known-broken cases).
+        @test count(r -> !r.cold_converged, rows) == 3
     end
 end

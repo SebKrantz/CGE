@@ -72,13 +72,26 @@ ones — don't reorder without checking what each later block reads):
    `er`, the exchange rate). Several quantities are computed twice deliberately (e.g. `x0`/`ac` before
    and after `ad` is derived) to maintain internal consistency, exactly as in the original.
 
-4. **`solve(p::Params; silent=true, tol=1e-8, max_iter=3000) -> (sim, status, converged, iterations,
-   elapsed)`**: builds a fresh JuMP `Model` reading every parameter from `p` (never from a global),
-   declares ~36 endogenous variable groups, ~30 `@NLconstraint` equation blocks (price,
-   production/factor, trade (Armington/CET), demand, and closure-rule blocks — see the README's "Key
-   equations" table), sets a dummy objective (`Min 1`) so the solve is a pure feasibility problem,
-   calls `set_silent`/sets Ipopt `tol`/`max_iter`, calls `JuMP.optimize!`, and extracts all
-   `JuMP.value.(...)` results into a `Simulation`.
+4. **`solve(p::Params; silent=true, tol=1e-8, max_iter=3000, start=nothing, steps=1, base=nothing) ->
+   (sim, status, converged, iterations, elapsed)`**: `solve` itself is now a thin wrapper — when
+   `steps == 1` (default) it calls `_solve_once(p; ..., start)` directly; when `steps > 1` it walks a
+   linear homotopy from `base` (the pre-shock `Params`, via `_interp_params`) to `p` in `steps` equal
+   increments, warm-starting each from the previous one's solution, and returns the last step's
+   result. `_solve_once` is the original model-building body: builds a fresh JuMP `Model` reading
+   every parameter from `p` (never from a global), declares ~36 endogenous variable groups, ~30
+   `@NLconstraint` equation blocks (price, production/factor, trade (Armington/CET), demand, and
+   closure-rule blocks — see the README's "Key equations" table), sets a dummy objective (`Min 1`) so
+   the solve is a pure feasibility problem, calls `set_silent`/sets Ipopt `tol`/`max_iter`, calls
+   `JuMP.optimize!`, and extracts all `JuMP.value.(...)` results into a `Simulation`. Every
+   `@variable`'s `start` clause now runs through a small `sv0`/`sv1`/`sv2` closure that reads from
+   `start::Union{Nothing,Simulation}` when given, falling back to exactly the old base-year `*0`
+   default (or `nothing`, for the handful of variables that never had one) when `start === nothing` —
+   this is what makes `start = nothing` (the default) byte-identical to the pre-warm-start behavior,
+   which `test/runtests.jl`'s reference.json check depends on. See the README's "Solving shocked
+   scenarios reliably" section and `test/robustness_grid.jl`'s header comment for why this exists (a
+   cold solve of a shocked `Params` can report a spurious Ipopt `LOCALLY_INFEASIBLE`) and for the
+   diagnosis of the residual cases warm-starting alone doesn't fix. `mu_strategy = "adaptive"` was
+   tried and rejected as a global default — it actually breaks the *baseline* solve.
 
 `with_shocks(p::Params, overrides::Dict{Symbol,Any}) -> Params` replaces the old "mutate a global,
 call `cammodel()` again" pattern: it returns a `deepcopy` of `p` with `overrides` applied (a scalar

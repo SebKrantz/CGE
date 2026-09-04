@@ -366,7 +366,9 @@ end
 # =============================================================================
 
 """
-    solve(p::Params; silent=true, tol=1e-8, max_iter=3000)
+    solve(p::Params; silent=true, tol=1e-8, max_iter=3000,
+          start::Union{Nothing,Simulation}=nothing, steps::Int=1,
+          base::Union{Nothing,Params}=nothing)
         -> (sim::Simulation, status::String, converged::Bool, iterations, elapsed)
 
 Builds a fresh JuMP model reading every parameter from `p` (never from a global),
@@ -375,8 +377,83 @@ the raw JuMP `termination_status` as a string (e.g. `"LOCALLY_SOLVED"`); `conver
 is `true` for `OPTIMAL`, `LOCALLY_SOLVED`, or `ALMOST_LOCALLY_SOLVED` (Ipopt reports
 "Solved To Acceptable Level" for both the baseline and `sim1` at default tolerances --
 see the exploration report). `p` itself is never mutated.
+
+Every solve of a *shocked* `Params` still starts every variable from the raw base-year
+`*0` data by default (`start = nothing`), exactly like the original script. Two knobs
+help a modest policy shock converge reliably instead of landing on a spurious
+`LOCALLY_INFEASIBLE` (see `test/robustness_grid.jl` and the exploration report for why
+that status shows up on a cold start even though the shocked equations are, in fact,
+satisfiable a hair away from where Ipopt gives up):
+
+- `start`: a previously-solved `Simulation` (typically the cached baseline) whose values
+  seed every variable's start value via `set_start_value`, instead of the base-year `*0`
+  data. This is the preferred fix -- it costs nothing extra and does not change what
+  equations are solved.
+- `steps`: solve a homotopy path in `steps` equal linear increments from `base` (the
+  *pre-shock* `Params`) to `p` (the shocked `Params`), warm-starting each increment from
+  the previous one's solution. Only use this if `start` alone still fails -- it requires
+  `base` and costs `steps` solves instead of one.
 """
-function solve(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::Int=3000)
+function solve(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::Int=3000,
+               start::Union{Nothing,Simulation}=nothing, steps::Int=1,
+               base::Union{Nothing,Params}=nothing)
+    steps >= 1 || error("solve: steps must be >= 1")
+    if steps == 1
+        return _solve_once(P; silent, tol, max_iter, start)
+    end
+    base === nothing && error("solve: steps > 1 requires `base` (the pre-shock Params) so " *
+                              "the shock can be applied gradually via linear interpolation")
+    cur_start = start
+    local sim, status, converged, iterations, elapsed
+    total_elapsed = 0.0
+    for k in 1:steps
+        frac = k / steps
+        Pk = _interp_params(base, P, frac)
+        sim, status, converged, iterations, elapsed =
+            _solve_once(Pk; silent, tol, max_iter, start = cur_start)
+        total_elapsed += elapsed
+        converged || break
+        cur_start = sim
+    end
+    return sim, status, converged, iterations, total_elapsed
+end
+
+"""
+    _interp_params(base::Params, target::Params, frac::Float64) -> Params
+
+Linear homotopy step: a deep copy of `base` with every scalar `Float64` field and every
+`Dict` field's values moved a `frac` fraction of the way from `base`'s value to
+`target`'s value (fields that don't differ between `base` and `target` -- i.e. everything
+`with_shocks` didn't touch -- are unaffected since the interpolation is a no-op). Used
+only by `solve`'s `steps` homotopy.
+"""
+function _interp_params(base::Params, target::Params, frac::Float64)
+    p = deepcopy(base)
+    for f in fieldnames(Params)
+        bv = getfield(base, f)
+        tv = getfield(target, f)
+        if bv isa AbstractDict
+            d = getfield(p, f)
+            for k in keys(tv)
+                b = get(bv, k, tv[k])
+                d[k] = b + frac * (tv[k] - b)
+            end
+        elseif bv isa Float64
+            setfield!(p, f, bv + frac * (tv - bv))
+        end
+    end
+    return p
+end
+
+"""
+    _solve_once(P::Params; silent, tol, max_iter, start) -> (sim, status, converged, iterations, elapsed)
+
+Builds and solves one JuMP model from `P` -- the actual model definition (was the whole
+body of `solve` before warm-starting/homotopy were added). `start`, if given, seeds every
+variable's start value from that `Simulation` instead of `P`'s base-year `*0` data.
+"""
+function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::Int=3000,
+                     start::Union{Nothing,Simulation}=nothing)
     SEC, IT, ITN, LC = P.SEC, P.IT, P.ITN, P.LC
     io, imat, wdist, xle, alphl = P.io, P.imat, P.wdist, P.xle, P.alphl
     depr, rhoc, rhot, eta   = P.depr, P.rhoc, P.rhot, P.eta
@@ -394,58 +471,75 @@ function solve(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::Int=30
     silent && set_silent(cgecam)
     set_optimizer_attribute(cgecam, "tol", tol)
     set_optimizer_attribute(cgecam, "max_iter", max_iter)
+    # NOTE on Ipopt tuning (see the exploration report and test/robustness_grid.jl): the
+    # obvious feasibility-problem knob, `mu_strategy = "adaptive"`, was tried and rejected --
+    # it actually breaks the *baseline* solve (LOCALLY_INFEASIBLE instead of
+    # ALMOST_LOCALLY_SOLVED) with Ipopt's default monotone barrier schedule working fine, so
+    # this model's ill-conditioning is specific enough that a "generally more robust" solver
+    # setting is not a safe global default. Warm-starting from a previously-solved
+    # `Simulation` (the `start` keyword above) is what actually fixes the grid's spurious
+    # LOCALLY_INFEASIBLE cases -- see `solve`'s docstring.
+
+    # -------------------------------------------------------------------------
+    # Start-value helpers: read from `start` (a previously-solved Simulation, typically the
+    # cached baseline) when given, otherwise fall back to `default` (the base-year `*0` data,
+    # or `nothing` for the handful of variables the original script never seeded).
+    # -------------------------------------------------------------------------
+    sv0(field::Symbol, default) = start === nothing ? default : getfield(start, field)
+    sv1(field::Symbol, i, default) = start === nothing ? default : getfield(start, field)[i]
+    sv2(field::Symbol, i, l, default) = start === nothing ? default : getfield(start, field)[i, l]
 
     # -------------------------------------------------------------------------
     # DECISION VARIABLES  (all strictly positive via lower bound 1e-6)
     # -------------------------------------------------------------------------
     @variables cgecam begin
         # Prices
-        pd[i in SEC]  >= 1e-6, (start = pd0[i])   # Domestic goods price
-        pm[i in SEC]  >= 1e-6, (start = pm0[i])   # Domestic price of imports
-        pe[i in SEC]  >= 1e-6, (start = pe0[i])   # Domestic price of exports
-        pk[i in SEC]  >= 1e-6, (start = pd0[i])   # Capital rental rate by sector
-        px[i in SEC]  >= 1e-6, (start = pd0[i])   # Average output price (net of indirect tax)
-        p[i in SEC]   >= 1e-6, (start = pd0[i])   # Composite (Armington) goods price
-        pva[i in SEC] >= 1e-6, (start = pva0[i])  # Value-added price
-        pwm[i in SEC] >= 1e-6, (start = pwm0[i])  # World import price (foreign currency)
-        pwe[i in SEC] >= 1e-6, (start = pwe0[i])  # World export price (foreign currency)
-        tm[i in SEC]  >= 1e-6, (start = tm0[i])   # Tariff rates
+        pd[i in SEC]  >= 1e-6, (start = sv1(:pd, i, pd0[i]))   # Domestic goods price
+        pm[i in SEC]  >= 1e-6, (start = sv1(:pm, i, pm0[i]))   # Domestic price of imports
+        pe[i in SEC]  >= 1e-6, (start = sv1(:pe, i, pe0[i]))   # Domestic price of exports
+        pk[i in SEC]  >= 1e-6, (start = sv1(:pk, i, pd0[i]))   # Capital rental rate by sector
+        px[i in SEC]  >= 1e-6, (start = sv1(:px, i, pd0[i]))   # Average output price (net of indirect tax)
+        p[i in SEC]   >= 1e-6, (start = sv1(:p, i, pd0[i]))    # Composite (Armington) goods price
+        pva[i in SEC] >= 1e-6, (start = sv1(:pva, i, pva0[i])) # Value-added price
+        pwm[i in SEC] >= 1e-6, (start = sv1(:pwm, i, pwm0[i])) # World import price (foreign currency)
+        pwe[i in SEC] >= 1e-6, (start = sv1(:pwe, i, pwe0[i])) # World export price (foreign currency)
+        tm[i in SEC]  >= 1e-6, (start = sv1(:tm, i, tm0[i]))   # Tariff rates
 
         # Production quantities
-        x[i in SEC]   >= 1e-6, (start = x0[i])    # Composite good supply (Armington)
-        xd[i in SEC]  >= 1e-6, (start = xd0[i])   # Domestic output by sector
-        xxd[i in SEC] >= 1e-6, (start = xxd0[i])  # Domestic sales (output minus exports)
-        e[i in SEC]   >= 1e-6, (start = e0[i])    # Exports by sector
-        m[i in SEC]   >= 1e-6, (start = m0[i])    # Imports by sector
+        x[i in SEC]   >= 1e-6, (start = sv1(:x, i, x0[i]))     # Composite good supply (Armington)
+        xd[i in SEC]  >= 1e-6, (start = sv1(:xd, i, xd0[i]))   # Domestic output by sector
+        xxd[i in SEC] >= 1e-6, (start = sv1(:xxd, i, xxd0[i])) # Domestic sales (output minus exports)
+        e[i in SEC]   >= 1e-6, (start = sv1(:e, i, e0[i]))     # Exports by sector
+        m[i in SEC]   >= 1e-6, (start = sv1(:m, i, m0[i]))     # Imports by sector
 
         # Factors
-        k[i in SEC]            >= 1e-6, (start = k0[i])    # Capital stock by sector
-        wa[l in LC]            >= 1e-6, (start = wa0[l])   # Economy-wide wage by labour type
-        ls[l in LC]            >= 1e-6, (start = ls0[l])   # Labour supply by category
-        labd[i in SEC, l in LC] >= 1e-6, (start = xle[i,l]) # Employment (sector × labour type)
+        k[i in SEC]            >= 1e-6, (start = sv1(:k, i, k0[i]))     # Capital stock by sector
+        wa[l in LC]            >= 1e-6, (start = sv1(:wa, l, wa0[l]))   # Economy-wide wage by labour type
+        ls[l in LC]            >= 1e-6, (start = sv1(:ls, l, ls0[l]))   # Labour supply by category
+        labd[i in SEC, l in LC] >= 1e-6, (start = sv2(:labd, i, l, xle[i,l])) # Employment (sector × labour type)
 
         # Demand aggregates
-        int[i in SEC]  >= 1e-6, (start = int0[i])   # Intermediate input demand
-        cd[i in SEC]   >= 1e-6, (start = cd0[i])    # Private consumption demand
-        gd[i in SEC]   >= 1e-6                       # Government consumption demand
-        id[i in SEC]   >= 1e-6, (start = id0[i])    # Investment demand by sector of origin
-        dst[i in SEC]  >= 1e-6, (start = dst0[i])   # Inventory investment
-        y              >= 1e-6, (start = y0)          # Private GDP (value added minus depreciation)
-        gr             >= 1e-6, (start = gr0)         # Government revenue
-        tariff         >= 1e-6, (start = 76.548)      # Tariff revenue
-        indtax         >= 1e-6                         # Indirect tax revenue
-        duty           >= 1e-6                         # Export duty revenue
-        gdtot          >= 1e-6                         # Total government consumption volume
-        mps            >= 1e-6                         # Marginal propensity to save (households)
-        hhsav          >= 1e-6                         # Household savings
-        govsav         >= 1e-6                         # Government savings (budget surplus/deficit)
-        deprecia       >= 1e-6                         # Economy-wide depreciation expenditure
-        savings        >= 1e-6                         # Total savings (= total investment)
-        fsav           >= 1e-6, (start = fsav0)       # Foreign savings (current-account deficit)
-        dk[i in SEC]   >= 1e-6                         # Investment by sector of destination
+        int[i in SEC]  >= 1e-6, (start = sv1(:int, i, int0[i]))  # Intermediate input demand
+        cd[i in SEC]   >= 1e-6, (start = sv1(:cd, i, cd0[i]))    # Private consumption demand
+        gd[i in SEC]   >= 1e-6, (start = sv1(:gd, i, nothing))    # Government consumption demand
+        id[i in SEC]   >= 1e-6, (start = sv1(:id, i, id0[i]))    # Investment demand by sector of origin
+        dst[i in SEC]  >= 1e-6, (start = sv1(:dst, i, dst0[i]))  # Inventory investment
+        y              >= 1e-6, (start = sv0(:y, y0))             # Private GDP (value added minus depreciation)
+        gr             >= 1e-6, (start = sv0(:gr, gr0))           # Government revenue
+        tariff         >= 1e-6, (start = sv0(:tariff, 76.548))    # Tariff revenue
+        indtax         >= 1e-6, (start = sv0(:indtax, nothing))    # Indirect tax revenue
+        duty           >= 1e-6, (start = sv0(:duty, nothing))      # Export duty revenue
+        gdtot          >= 1e-6, (start = sv0(:gdtot, nothing))     # Total government consumption volume
+        mps            >= 1e-6, (start = sv0(:mps, nothing))       # Marginal propensity to save (households)
+        hhsav          >= 1e-6, (start = sv0(:hhsav, nothing))     # Household savings
+        govsav         >= 1e-6, (start = sv0(:govsav, nothing))    # Government savings (budget surplus/deficit)
+        deprecia       >= 1e-6, (start = sv0(:deprecia, nothing))  # Economy-wide depreciation expenditure
+        savings        >= 1e-6, (start = sv0(:savings, nothing))   # Total savings (= total investment)
+        fsav           >= 1e-6, (start = sv0(:fsav, fsav0))       # Foreign savings (current-account deficit)
+        dk[i in SEC]   >= 1e-6, (start = sv1(:dk, i, nothing))     # Investment by sector of destination
 
         # Welfare
-        omega                                           # Cobb-Douglas utility (welfare indicator)
+        omega, (start = sv0(:omega, nothing))                       # Cobb-Douglas utility (welfare indicator)
     end
 
     # -------------------------------------------------------------------------

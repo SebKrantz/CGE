@@ -122,13 +122,50 @@ A shock value is a dict key naming a `Params` field and either a new scalar leve
 `:tm0 => Dict(:services => 0.30)`). Values are always the new **level**, never a
 percent change.
 
+### Solving shocked scenarios reliably: `start` and `steps`
+
+Solving a shocked `Params` cold — every variable starting from the base-year `*0` data,
+exactly like the original script, regardless of how far the shock has moved the
+equilibrium — can return Ipopt's `LOCALLY_INFEASIBLE` even though the shocked equations
+are, in fact, satisfiable (e.g. a +5pp import tariff on `services`). See
+`test/robustness_grid.jl`'s header comment for the full exploration; in short, this is a
+solver artifact of starting far from the new equilibrium with a pure feasibility objective
+(`Min 1`), not a real economic infeasibility.
+
+Fix it by warm-starting from a previously-solved `Simulation` — typically the baseline:
+
+```julia
+baseline, = solve(params)
+shocked = with_shocks(params, Dict{Symbol,Any}(:tm0 => Dict(:services => params.tm0[:services] + 0.05)))
+sim, status, converged, iterations, elapsed = solve(shocked; start = baseline)
+```
+
+This alone fixes most modest single-shock scenarios (in the grid: 27/59 cold → 44/59 warm)
+and costs nothing extra (a warm solve typically takes <0.03s, vs. ~2s cold). For a
+residual set of larger or sector-specific shocks that still fail even warm, retry with a
+`steps`-increment homotopy from the pre-shock `Params` (`base`):
+
+```julia
+sim, status, converged, iterations, elapsed =
+    solve(shocked; start = baseline, steps = 4, base = params)
+```
+
+This applies the shock in `steps` equal linear increments, warm-starting each from the
+previous one's solution. (In the grid's residual ~15/59 failures, homotopy up to 100 steps
+did not help either — residual inspection at the returned point shows every real equation
+already satisfied to ~1e-13, so these are Ipopt restoration-phase misreports rather than
+genuine infeasibilities, most likely tied to the model's pre-existing "structurally zero
+but bounded away from zero at 1e-6" variables, e.g. `gd` for the 10 sectors with
+`gles = 0`. Relaxing those bounds isn't an option here — it would break the bit-for-bit
+match to `test/reference.json`.)
+
 ### API
 
 | Function | Signature | Purpose |
 |---|---|---|
 | `load_data` | `(path) -> RawData` | Reads the 5 `camdata.xlsx` sheets (same hardcoded ranges as before) |
 | `calibrate` | `(raw::RawData) -> Params` | Closed-form calibration algebra (unchanged economics) |
-| `solve` | `(p::Params; silent=true, tol=1e-8, max_iter=3000) -> (sim, status, converged, iterations, elapsed)` | Builds a fresh JuMP model from `p`, solves with Ipopt |
+| `solve` | `(p::Params; silent=true, tol=1e-8, max_iter=3000, start=nothing, steps=1, base=nothing) -> (sim, status, converged, iterations, elapsed)` | Builds a fresh JuMP model from `p`, solves with Ipopt; `start` warm-starts from a previous `Simulation`, `steps`>1 homotopies from `base` (see above) |
 | `with_shocks` | `(p::Params, overrides::Dict{Symbol,Any}) -> Params` | Deep-copies `p` and applies level overrides |
 | `example` | `() -> (baseline=Simulation, sim1=Simulation)` | Reproduces the two runs below and prints a summary |
 
@@ -156,7 +193,14 @@ other parameter.
 `test/runtests.jl` (`julia --project=. test/runtests.jl`) checks that the baseline
 reproduces the base-year data and that `sim1` matches `test/reference.json` — a
 snapshot of the original, pre-refactor script's output — to 1e-6 relative on every
-value.
+value (both solved cold, exactly as the original script did, so this remains a
+bit-for-bit regression guard on the refactor). It also runs a reduced (~5-scenario)
+robustness testset confirming `start`'s warm-start fix on the exact cases the original
+bug report found.
+
+`test/robustness_grid.jl` (`julia --project=. test/robustness_grid.jl`) is the full
+~60-scenario grid behind that testset — see its header comment for the shock list and
+the cold/warm/homotopy convergence counts.
 
 ---
 
