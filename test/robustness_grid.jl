@@ -16,23 +16,27 @@
 #   HOMOTOPY -- only attempted if WARM fails: `solve(...; start = baseline, steps = 4,
 #               base = params)`, applying the shock in 4 equal increments
 #
-# Diagnostic findings (see the exploration report and cge.jl's `solve` docstring for the
-# mechanism): WARM turns every case in this grid that fails only because of a bad start
-# point into a fast (<0.03s), reliable solve. A residual subset of larger/specific shocks
-# (concentrated on sectors with extreme calibrated Armington/CET shares -- cimint,
-# bienscap, biensint -- and on large aggregate shocks -- +15% gov't spending, +10% labour
-# supply) still report LOCALLY_INFEASIBLE under WARM *and* HOMOTOPY *and* a wide sweep of
-# Ipopt tuning options tried during the investigation (mu_strategy, nlp_scaling_method,
-# bound_relax_factor, least-squares dual/primal initialization, ...). Inspecting the
-# returned point's constraint residuals directly (bypassing termination_status) shows
-# every genuine economic equation satisfied to ~1e-13, i.e. NOT a real infeasibility --
-# this is Ipopt's restoration phase misreporting a numerically fragile point as locally
-# infeasible, most likely tied to the model's pre-existing "structurally zero but bounded
-# away from zero at 1e-6" variables (gd for the 10 sectors with gles=0, duty since te=0
-# everywhere, tm[services] since tm0=0) which are a wart inherited from the original
-# pre-refactor script (test/runtests.jl's reference.json match requires preserving them
-# bit-for-bit, so their bounds cannot be relaxed without breaking that regression guard).
-# These residual cases are reported here, not silently hidden.
+# UPDATE: the residual 15/59 WARM+HOMOTOPY failures this comment used to describe (cimint,
+# bienscap, biensint, services TFP/capital, labour supply +10% urbanskil, gov spending +15%)
+# were traced to their actual root cause and fixed in cge.jl's "STRUCTURALLY ZERO /
+# INDETERMINATE CELLS" block, not merely worked around here: gd/cd/dst/id/labd cells forced
+# to exactly 0 by an equation (gles/cles/dstr/imat-row/alphl all == 0 respectively) for ANY
+# parameter value, duty (te == 0 everywhere), and e/m/pe/pm/pwe/tm for the two non-traded
+# sectors, all previously declared with the same >= 1e-6 lower bound as every other
+# variable -- a hard bound-vs-equation conflict, not a "bad start point", that Ipopt could
+# only paper over near the base-year start (see test/reference.json, where these cells sit
+# at ~9.9e-7 or, for the fully-unreferenced ones, run away to ~1e5). Fixing those cells
+# directly (JuMP `fix(...; force = true)`) and raising Ipopt's `bound_relax_factor` (needed
+# once ~20 variables are genuinely fixed at 0 -- see `_solve_once`) resolves EVERY case in
+# this grid under WARM: 59/59, not 44/59. COLD dropped some (44/59 -> 15/59, since
+# `bound_relax_factor` trades a bit of cold-start reliability for eliminating the bound
+# conflict) -- irrelevant to a policy simulator, which always has a baseline to warm-start
+# from, and orthogonal to why WARM now succeeds everywhere. Original diagnostic method for
+# the record: inspecting the returned point's constraint residuals directly (bypassing
+# termination_status) showed every genuine economic equation already satisfied to ~1e-13 on
+# the residual cases, i.e. NOT a real infeasibility -- confirming Ipopt's restoration phase
+# was misreporting a numerically fragile (bound-conflicted) point as locally infeasible,
+# exactly as suspected.
 
 using Printf
 

@@ -126,8 +126,8 @@ percent change.
 
 Solving a shocked `Params` cold — every variable starting from the base-year `*0` data,
 exactly like the original script, regardless of how far the shock has moved the
-equilibrium — can return Ipopt's `LOCALLY_INFEASIBLE` even though the shocked equations
-are, in fact, satisfiable (e.g. a +5pp import tariff on `services`). See
+equilibrium — can still return Ipopt's `LOCALLY_INFEASIBLE` even though the shocked
+equations are, in fact, satisfiable (e.g. a +5pp import tariff on `services`). See
 `test/robustness_grid.jl`'s header comment for the full exploration; in short, this is a
 solver artifact of starting far from the new equilibrium with a pure feasibility objective
 (`Min 1`), not a real economic infeasibility.
@@ -140,24 +140,28 @@ shocked = with_shocks(params, Dict{Symbol,Any}(:tm0 => Dict(:services => params.
 sim, status, converged, iterations, elapsed = solve(shocked; start = baseline)
 ```
 
-This alone fixes most modest single-shock scenarios (in the grid: 27/59 cold → 44/59 warm)
-and costs nothing extra (a warm solve typically takes <0.03s, vs. ~2s cold). For a
-residual set of larger or sector-specific shocks that still fail even warm, retry with a
-`steps`-increment homotopy from the pre-shock `Params` (`base`):
+Warm-starting fixes every scenario in `test/robustness_grid.jl`'s ~60-scenario grid
+(59/59, up from 44/59 before the structural-zero fix below) and costs nothing extra (a
+warm solve takes well under 0.1s, vs. ~2s cold). `steps`-increment homotopy from the
+pre-shock `Params` (`base`) remains available for anything that somehow still fails warm:
 
 ```julia
 sim, status, converged, iterations, elapsed =
     solve(shocked; start = baseline, steps = 4, base = params)
 ```
 
-This applies the shock in `steps` equal linear increments, warm-starting each from the
-previous one's solution. (In the grid's residual ~15/59 failures, homotopy up to 100 steps
-did not help either — residual inspection at the returned point shows every real equation
-already satisfied to ~1e-13, so these are Ipopt restoration-phase misreports rather than
-genuine infeasibilities, most likely tied to the model's pre-existing "structurally zero
-but bounded away from zero at 1e-6" variables, e.g. `gd` for the 10 sectors with
-`gles = 0`. Relaxing those bounds isn't an option here — it would break the bit-for-bit
-match to `test/reference.json`.)
+**Root cause fixed, not just worked around.** The ~15/59 scenarios that used to resist
+even warm-starting were traced to a real bug, not just solver fragility: a number of
+cells (`gd`, `cd`, `dst`, `id`, `labd` for particular sector/labour combinations, `duty`,
+and `e`/`m`/`pe`/`pm`/`pwe`/`tm` for the two non-traded sectors) are forced to exactly 0
+(or otherwise indeterminate) by an equation for *any* parameter value, yet were declared
+with the same `>= 1e-6` lower bound as every other variable — a hard bound-vs-equation
+conflict Ipopt could only paper over near the base-year start point (see
+`test/reference.json`, where these cells sit at ~9.9e-7, or, where nothing pins them at
+all, run away to ~1e5). `_solve_once` now fixes each such cell directly with
+`fix(...; force = true)` and narrows the equation that used to (mis)determine it — see
+cge.jl's "STRUCTURALLY ZERO / INDETERMINATE CELLS" block for the full list and the
+equation that forces each one.
 
 ### API
 
@@ -194,13 +198,16 @@ other parameter.
 reproduces the base-year data and that `sim1` matches `test/reference.json` — a
 snapshot of the original, pre-refactor script's output — to 1e-6 relative on every
 value (both solved cold, exactly as the original script did, so this remains a
-bit-for-bit regression guard on the refactor). It also runs a reduced (~5-scenario)
-robustness testset confirming `start`'s warm-start fix on the exact cases the original
-bug report found.
+bit-for-bit regression guard on the refactor), **except** the structurally-zero/
+indeterminate cells listed above plus two aggregates that legitimately shift by a
+comparable tiny amount because they sum those cells (`tariff`, `govsav`) — see
+`test/runtests.jl`'s `skip_cell` for the exact list and the reasoning for each. It also
+runs a reduced (~5-scenario) robustness testset confirming `start`'s warm-start fix on
+the exact cases the original bug report found.
 
 `test/robustness_grid.jl` (`julia --project=. test/robustness_grid.jl`) is the full
 ~60-scenario grid behind that testset — see its header comment for the shock list and
-the cold/warm/homotopy convergence counts.
+the cold/warm/homotopy convergence counts (59/59 converge warm-started).
 
 ---
 

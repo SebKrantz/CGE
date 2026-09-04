@@ -85,13 +85,29 @@ ones — don't reorder without checking what each later block reads):
    `JuMP.optimize!`, and extracts all `JuMP.value.(...)` results into a `Simulation`. Every
    `@variable`'s `start` clause now runs through a small `sv0`/`sv1`/`sv2` closure that reads from
    `start::Union{Nothing,Simulation}` when given, falling back to exactly the old base-year `*0`
-   default (or `nothing`, for the handful of variables that never had one) when `start === nothing` —
-   this is what makes `start = nothing` (the default) byte-identical to the pre-warm-start behavior,
-   which `test/runtests.jl`'s reference.json check depends on. See the README's "Solving shocked
-   scenarios reliably" section and `test/robustness_grid.jl`'s header comment for why this exists (a
-   cold solve of a shocked `Params` can report a spurious Ipopt `LOCALLY_INFEASIBLE`) and for the
-   diagnosis of the residual cases warm-starting alone doesn't fix. `mu_strategy = "adaptive"` was
-   tried and rejected as a global default — it actually breaks the *baseline* solve.
+   default (or `nothing`, for the handful of variables that never had one) when `start === nothing`.
+   See the README's "Solving shocked scenarios reliably" section and `test/robustness_grid.jl`'s
+   header comment for why `start`/`steps` exist (a cold solve of a shocked `Params` can report a
+   spurious Ipopt `LOCALLY_INFEASIBLE`). `mu_strategy = "adaptive"` was tried and rejected as a global
+   default — it actually breaks the *baseline* solve.
+
+   **Structurally-zero / indeterminate cells (fixed, not just worked around):** right after the
+   `@variables` block, `_solve_once` `fix(...; force = true)`s ~20 cells that an equation forces to
+   exactly 0 (or leaves fully indeterminate) *for any parameter value* — `gd[i]`/`cd[i]`/`dst[i]` for
+   sectors with `gles[i]`/`cles[i]`/`dstr[i] == 0`, `id[i]` for sectors whose `imat` row is entirely
+   zero, `labd[i,l]` for zero-base-employment cells, `duty` (`te ≡ 0`), and `e`/`m`/`pe`/`pm`/`pwe`/`tm`
+   for the two non-traded sectors — and narrows the corresponding equation's index set to match (see
+   the block's own comment for the equation that forces each one). These previously carried the same
+   `>= 1e-6` lower bound as every other variable, an inherent bound-vs-equation conflict (not a bad
+   start point) that was the actual root cause of most of `test/robustness_grid.jl`'s residual
+   `LOCALLY_INFEASIBLE` cases. Fixing it, plus raising Ipopt's `bound_relax_factor` to `1e-5` (needed
+   once this many variables are genuinely fixed at 0 — see Ipopt's own doc for that option), takes the
+   grid from 44/59 to 59/59 converged warm-started. This makes `start = nothing` (cold, the default)
+   **no longer** byte-identical to the pre-fix script on these specific cells — expected, since they
+   used to be wrong (lower-bound-clipped to ~9.9e-7, or, where nothing pinned them, an Ipopt runaway
+   to ~1e5); `test/runtests.jl`'s reference.json check now excludes exactly these cells (plus
+   `tm[services]` and the `tariff`/`govsav` aggregates that ripple from them by a comparable tiny
+   amount) via `skip_cell`, and still requires 1e-6 relative agreement on every other cell.
 
 `with_shocks(p::Params, overrides::Dict{Symbol,Any}) -> Params` replaces the old "mutate a global,
 call `cammodel()` again" pattern: it returns a `deepcopy` of `p` with `overrides` applied (a scalar

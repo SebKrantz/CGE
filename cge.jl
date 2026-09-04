@@ -471,6 +471,21 @@ function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::
     silent && set_silent(cgecam)
     set_optimizer_attribute(cgecam, "tol", tol)
     set_optimizer_attribute(cgecam, "max_iter", max_iter)
+    # `bound_relax_factor` (default 1e-8): raised to 1e-5 because this model now has
+    # ~20 variables genuinely FIXED at exactly 0 (see the "STRUCTURALLY ZERO" block
+    # below) -- Ipopt's own doc for this option describes exactly that situation ("if
+    # too many bounds are exactly satisfied, this can cause problems for the
+    # algorithm"). Verified necessary: with the structurally-zero cells fixed but this
+    # left at Ipopt's default (or even at 1e-6), the baseline solve itself
+    # intermittently reports a spurious LOCALLY_INFEASIBLE even though the returned
+    # point is a perfectly good solution (every real equation satisfied to high
+    # precision) -- 1e-5 was the smallest value that converged reliably across repeated
+    # checks. Still tiny: every fixed cell lands within ~1e-8 of its true value (see
+    # test/runtests.jl's `skip_cell`, which excludes exactly those cells from the
+    # reference.json check), and every other variable sits comfortably off its bound in
+    # equilibrium, so this is a no-op for them -- confirmed 0 relative difference on
+    # every non-structurally-zero cell.
+    set_optimizer_attribute(cgecam, "bound_relax_factor", 1e-5)
     # NOTE on Ipopt tuning (see the exploration report and test/robustness_grid.jl): the
     # obvious feasibility-problem knob, `mu_strategy = "adaptive"`, was tried and rejected --
     # it actually breaks the *baseline* solve (LOCALLY_INFEASIBLE instead of
@@ -543,6 +558,101 @@ function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::
     end
 
     # -------------------------------------------------------------------------
+    # STRUCTURALLY ZERO / INDETERMINATE CELLS
+    #
+    # A number of cells are forced to exactly zero by an equation for ANY value of
+    # every other parameter or variable -- not merely small, or zero only at this
+    # particular shock -- yet were given the same >= 1e-6 lower bound as every other
+    # variable above. That makes the feasibility problem inconsistent by construction
+    # (the equation demands 0, the bound forbids anything below 1e-6): Ipopt tolerates
+    # the resulting ~1e-6 constraint violation near the base-year start point (see
+    # test/reference.json, where these cells sit at ~9.9e-7, just under the bound), but
+    # it is the root cause of the spurious LOCALLY_INFEASIBLE reports on shocked solves
+    # documented in `solve`'s docstring and test/robustness_grid.jl (the concentration
+    # of residual failures in cimint/bienscap/biensint/services was the tell -- those
+    # sectors carry several of the cells below). Each such cell is fixed directly below
+    # with `fix(...; force = true)` instead of a lower bound, and the now-redundant
+    # equation that used to "force" it is dropped, or its index set narrowed, for that
+    # cell only (never for a non-zero cell -- see the comments at `gdeq`, `dutydef`,
+    # `closurem`, `closuree`, `cdeq`, `dsteq`, `ieq`, `profitmax`/`closurlp`/`closurla`
+    # below, where these used to live):
+    #
+    #   gd[i] for i with gles[i] == 0 -- gdeq: gd[i] == gles[i]*gdtot == 0 regardless
+    #       of gdtot (10 of 11 sectors in this data; only `publiques` has gles > 0)
+    #   cd[i] for i with cles[i] == 0 -- cdeq: p[i]*cd[i] == cles[i]*(1-mps)*y == 0
+    #       regardless of p/mps/y (sylvicult, cimint, bienscap in this data; `obj`
+    #       already excludes these via its own `cles[i] > 0.0` filter -- cdeq did not)
+    #   dst[i] for i with dstr[i] == 0 -- dsteq: dst[i] == dstr[i]*xd[i] == 0
+    #       regardless of xd (cimint, construct, services, publiques in this data)
+    #   id[i] for i with row i of `imat` entirely zero -- ieq: id[i] ==
+    #       sum(imat[i,j]*dk[j] for j in SEC) == 0 regardless of dk, because every
+    #       coefficient in the sum is 0 (only agsubsist/bienscap/construct actually
+    #       supply capital goods in this economy's `imat`; the other 8 sectors' rows
+    #       are all-zero)
+    #   labd[i,l] for (i,l) with alphl[l,i] == 0 -- profitmax[i,l]:
+    #       wa[l]*wdist[i,l]*labd[i,l] == xd[i]*pva[i]*alphl[l,i] has wdist[i,l] == 0
+    #       too at every such cell in this data, so BOTH sides are identically zero
+    #       regardless of wa/xd/pva/labd -- a zero-Jacobian-row equation carrying no
+    #       information, worse than merely redundant (this is exactly what closurlp/
+    #       closurla used to patch for their one cell each; profitmax's own zero row
+    #       means they were the only real source of the closure, just as
+    #       inconsistently bounded as everywhere else here). Two cells in this data:
+    #       labd[:publiques,:rural], labd[:agsubsist,:urbanskil] (zero base employment)
+    #   duty -- dutydef: duty == sum(te[it]*e[it]*pe[it] for it in IT) == 0 regardless
+    #       of e/pe, since te[it] == 0 for every it (no export duties in this model)
+    #   e[itn], m[itn] for itn in ITN -- closuree/closurem: non-traded sectors have no
+    #       exports or imports by construction, for any parameter value
+    #
+    # Fixing e[itn]/m[itn] leaves four cells indeterminate rather than zero (they now
+    # multiply an identically-zero quantity in the one equation that mentions them, or
+    # appear in no equation at all) -- reference.json shows exactly this: pe[itn] lands
+    # on an arbitrary small value that differs between baseline and sim1, and
+    # pm[itn]/pwe[itn]/tm[itn] (which appear in NO equation for itn -- pmdef/
+    # absorption1/costmin/pedef/tariffdef/closuret/caeq all index or sum over IT only)
+    # run away to ~1e5. Per cell, pin it to its base value (dropping the cell from the
+    # variable set is the alternative -- rejected here so every Simulation field keeps
+    # its full SEC-indexed shape, which callers rely on):
+    #
+    #   pe[itn]  -- appears only in sales[itn]: px*xd == pd*xxd + pe[itn]*e[itn]
+    #   pm[itn], pwe[itn], tm[itn] -- appear in no equation at all
+    #
+    # NOTE: tm[services] is a different case, deliberately NOT touched here: tm0
+    # happens to be 0 in this data's base year, but tm[services] is a live,
+    # shockable policy instrument (tariff scenarios on `services` set tm0[services] >
+    # 0), not a structural zero for any parameter value -- fixing it would silently
+    # break every such shock. Likewise id0/dst0/cd0 having zero cells beyond the ones
+    # above (e.g. id0[:construct], id0[:bienscap]) is a base-year coincidence, not a
+    # structural forcing -- imat's row for those sectors is NOT all-zero, so id there
+    # can legitimately move away from 0 under a shock, and is left untouched.
+    # -------------------------------------------------------------------------
+    zero_gd    = [i for i in SEC if gles[i] == 0.0]
+    nonzero_gd = [i for i in SEC if gles[i] != 0.0]
+    zero_cd    = [i for i in SEC if cles[i] == 0.0]
+    nonzero_cd = [i for i in SEC if cles[i] != 0.0]
+    zero_dst    = [i for i in SEC if dstr[i] == 0.0]
+    nonzero_dst = [i for i in SEC if dstr[i] != 0.0]
+    zero_id    = [i for i in SEC if all(imat[i, j] == 0.0 for j in SEC)]
+    nonzero_id = [i for i in SEC if !(i in zero_id)]
+    zero_labd  = [(i, l) for i in SEC, l in LC if alphl[l, i] == 0.0]
+
+    for i in zero_gd;  fix(gd[i],  0.0; force = true); end
+    for i in zero_cd;  fix(cd[i],  0.0; force = true); end
+    for i in zero_dst; fix(dst[i], 0.0; force = true); end
+    for i in zero_id;  fix(id[i],  0.0; force = true); end
+    for (i, l) in zero_labd
+        fix(labd[i, l], 0.0; force = true)
+    end
+    fix(duty, 0.0; force = true)
+    for itn in ITN
+        fix(e[itn],   0.0;       force = true)
+        fix(m[itn],   0.0;       force = true)
+        fix(pe[itn],  pd0[itn];  force = true)
+        fix(pm[itn],  pm0[itn];  force = true)
+        fix(pwe[itn], pwe0[itn]; force = true)
+        fix(tm[itn],  0.0;       force = true)
+    end
+
+    # -------------------------------------------------------------------------
     # EQUILIBRIUM CONDITIONS
     # -------------------------------------------------------------------------
     @NLconstraints cgecam begin
@@ -574,12 +684,21 @@ function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::
 
         # Cobb-Douglas production with heterogeneous labour categories and fixed capital:
         #   xd[i] = ad[i] * Π_l( labd[i,l]^alphl[l,i] ) * k[i]^(1 - Σ_l alphl[l,i])
-        activity[i in SEC],       xd[i] == ad[i] * prod(labd[i,l]^alphl[l,i] for l in LC) *
+        # The product skips l with alphl[l,i] == 0 -- mathematically a no-op (x^0 == 1
+        # for any x, so the value is unchanged), but symbolically necessary: at such a
+        # cell labd[i,l] is fixed to exactly 0 above, and automatic differentiation of
+        # x^0 is p*x^(p-1) = 0*x^(-1), which evaluates to 0*Inf = NaN at x == 0 even
+        # though the function value itself (1) and true derivative (0) are fine.
+        activity[i in SEC],       xd[i] == ad[i] * prod(labd[i,l]^alphl[l,i] for l in LC if alphl[l,i] != 0.0) *
                                             k[i]^(1 - sum(alphl[l,i] for l in LC))
 
         # Profit maximisation (Shephard's lemma / FOC for labour):
         #   wage × wdist × employment = value-added price × output × labour share
-        profitmax[i in SEC, l in LC], wa[l]*wdist[i,l]*labd[i,l] == xd[i]*pva[i]*alphl[l,i]
+        # Restricted to (i,l) with alphl[l,i] != 0 -- at every zero-employment cell in
+        # this data wdist[i,l] == 0 too, so both sides are identically zero regardless
+        # of wa/xd/pva/labd (a zero-Jacobian-row equation, not merely redundant); those
+        # cells' labd are fixed directly above instead.
+        profitmax[i in SEC, l in LC; alphl[l,i] != 0.0], wa[l]*wdist[i,l]*labd[i,l] == xd[i]*pva[i]*alphl[l,i]
 
         # Labour market clearing: total sectoral demand equals exogenous supply
         lmequil[l in LC],         sum(labd[i,l] for i in SEC) == ls[l]
@@ -611,11 +730,17 @@ function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::
         # Intermediate inputs: Leontief (fixed io coefficients), summed over using sectors
         inteq[j in SEC],          int[j] == sum(io[j,i]*xd[i] for i in SEC)
 
-        # Inventory investment: fixed proportion of sectoral gross output
-        dsteq[i in SEC],          dst[i] == dstr[i]*xd[i]
+        # Inventory investment: fixed proportion of sectoral gross output. Restricted
+        # to sectors with dstr[i] != 0 -- for dstr[i] == 0 this equation would force
+        # dst[i] == 0 for any xd, so those cells are fixed directly above instead.
+        dsteq[i in nonzero_dst],  dst[i] == dstr[i]*xd[i]
 
-        # Private consumption: linear Engel curves, share cles[i] of disposable income
-        cdeq[i in SEC],           p[i]*cd[i] == cles[i]*(1 - mps)*y
+        # Private consumption: linear Engel curves, share cles[i] of disposable
+        # income. Restricted to sectors with cles[i] != 0 -- for cles[i] == 0 this
+        # equation would force cd[i] == 0 for any p/mps/y, so those cells are fixed
+        # directly above instead (mirrors the `cles[i] > 0.0` filter `obj` already
+        # uses for the same reason).
+        cdeq[i in nonzero_cd],    p[i]*cd[i] == cles[i]*(1 - mps)*y
 
         # Private GDP: aggregate value added minus economy-wide depreciation
         gdp,                      y == sum(pva[i]*xd[i] for i in SEC) - deprecia
@@ -629,8 +754,11 @@ function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::
         # Government budget: revenue finances consumption plus budget surplus/deficit
         gruse,                    gr == sum(p[i]*gd[i] for i in SEC) + govsav
 
-        # Government consumption: each commodity gets a fixed share of total volume
-        gdeq[i in SEC],           gd[i] == gles[i]*gdtot
+        # Government consumption: each commodity gets a fixed share of total volume.
+        # Restricted to sectors with gles[i] != 0 -- for gles[i] == 0 this equation
+        # would force gd[i] == 0 for any gdtot, so those cells are fixed directly
+        # above instead (see the "STRUCTURALLY ZERO" block).
+        gdeq[i in nonzero_gd],    gd[i] == gles[i]*gdtot
 
         # Tariff revenue: ad-valorem tariffs applied to import values at world prices
         tariffdef,                tariff == sum(tm[it]*m[it]*pwm[it] for it in IT)*er
@@ -638,8 +766,10 @@ function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::
         # Indirect tax revenue: ad-valorem production taxes on gross output values
         indtaxdef,                indtax == sum(itax[i]*px[i]*xd[i] for i in SEC)
 
-        # Export duty revenue (zero at base since te = 0 everywhere)
-        dutydef,                  duty == sum(te[it]*e[it]*pe[it] for it in IT)
+        # Export duty revenue: always 0, since te[it] == 0 for every it (no export
+        # duties in this model version) -- `duty` is fixed directly above instead of
+        # via this equation (see the "STRUCTURALLY ZERO" block); keeping both would
+        # make `duty` doubly-determined (bound and equation both forcing the same 0).
 
         # Aggregate depreciation expenditure (capital consumption)
         depreq,                   deprecia == sum(depr[i]*pk[i]*k[i] for i in SEC)
@@ -651,8 +781,12 @@ function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::
         # net of inventory investment (inventories are not part of capital formation)
         prodinv[i in SEC],        pk[i]*dk[i] == kio[i]*savings - kio[i]*sum(dst[j]*p[j] for j in SEC)
 
-        # Investment demand by sector of origin: derived from capital composition matrix
-        ieq[i in SEC],            id[i] == sum(imat[i,j]*dk[j] for j in SEC)
+        # Investment demand by sector of origin: derived from capital composition
+        # matrix. Restricted to sectors whose `imat` row is not entirely zero -- for
+        # an all-zero row this equation would force id[i] == 0 for any dk (only
+        # agsubsist/bienscap/construct actually supply capital goods in this data),
+        # so those cells are fixed directly above instead.
+        ieq[i in nonzero_id],     id[i] == sum(imat[i,j]*dk[j] for j in SEC)
 
         # Current account balance: import bill = export revenues + net foreign savings
         caeq,                     sum(pwm[it]*m[it] for it in IT) == sum(pwe[it]*e[it] for it in IT) + fsav
@@ -672,10 +806,13 @@ function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::
         closuref,             fsav    == fsav0       # Foreign savings exogenous
         closuremp,             mps     == mps0        # Household saving rate fixed
         closureg,             gdtot   == gdtot0      # Government spending volume fixed
-        closurem[itn in ITN], m[itn]  == 0           # Non-traded: no imports
-        closurlp,             labd[:publiques, :rural]    == 0  # No rural labour in public sector
-        closurla,             labd[:agsubsist, :urbanskil] == 0  # No skilled labour in subsistence farming
-        closuree[itn in ITN], e[itn]  == 0           # Non-traded: no exports
+        # Non-traded: no imports/no exports -- m[itn]/e[itn] are fixed directly above
+        # instead of via an equation here (see the "STRUCTURALLY ZERO" block); keeping
+        # both would make them doubly-determined (bound and equation both forcing 0).
+        # No rural labour in public sector / no skilled labour in subsistence farming
+        # (closurlp/closurla) -- labd[:publiques,:rural]/labd[:agsubsist,:urbanskil]
+        # are fixed directly above instead (see the "STRUCTURALLY ZERO" block: this is
+        # the (i,l) pair where profitmax itself has a zero Jacobian row).
     end
 
     # Feasibility problem: solve for any point satisfying all equilibrium conditions
