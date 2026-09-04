@@ -79,18 +79,68 @@ All calibration data are in [`data/camdata.xlsx`](data/camdata.xlsx):
 
 ## Running the model
 
+As of the `eps-integration` branch, `cge.jl` is a module (`CGECameroon`) with **no
+include-time solves and no module-level mutable parameter state** — every calibrated
+parameter lives in a `Params` value you pass around explicitly, so two scenarios never
+leak into each other. The file is still named `cge.jl` (not `camcge.jl`).
+
 ```julia
-include("camcge.jl")
-# Baseline and Simulation 1 run automatically and are stored as Simulation structs.
+import Pkg; Pkg.activate(@__DIR__)   # uses this repo's own Project.toml
+include("cge.jl")
+using .CGECameroon
+
+raw    = load_data(joinpath(@__DIR__, "data", "camdata.xlsx"))  # read the workbook
+params = calibrate(raw)                                          # closed-form calibration
+baseline, status, converged, iterations, elapsed = solve(params) # fresh JuMP model, Ipopt
 ```
 
-Access results:
+Or, to reproduce the two runs below in one call:
+
+```julia
+baseline, sim1 = CGECameroon.example()
+```
+
+Access results (unchanged — `Simulation` still has the same 38 fields):
 
 ```julia
 baseline.xd   # domestic output by sector (baseline)
 sim1.xd       # domestic output after +10% agricultural capital shock
 sim1.y        # private GDP in Simulation 1
 ```
+
+Run a shock with `with_shocks`, which returns a shocked **deep copy** of `params` — the
+original is never mutated:
+
+```julia
+shocked = with_shocks(params, Dict{Symbol,Any}(:k0 => Dict(:agsubsist => params.k0[:agsubsist] * 1.10)))
+sim1, status, converged, iterations, elapsed = solve(shocked)
+```
+
+A shock value is a dict key naming a `Params` field and either a new scalar level
+(e.g. `:gdtot0 => 145.0`, `:fsav0 => 55.0`, `:er => 0.25`) or a
+`Dict{Symbol,<:Real}` of new per-sector/per-labour levels (e.g.
+`:tm0 => Dict(:services => 0.30)`). Values are always the new **level**, never a
+percent change.
+
+### API
+
+| Function | Signature | Purpose |
+|---|---|---|
+| `load_data` | `(path) -> RawData` | Reads the 5 `camdata.xlsx` sheets (same hardcoded ranges as before) |
+| `calibrate` | `(raw::RawData) -> Params` | Closed-form calibration algebra (unchanged economics) |
+| `solve` | `(p::Params; silent=true, tol=1e-8, max_iter=3000) -> (sim, status, converged, iterations, elapsed)` | Builds a fresh JuMP model from `p`, solves with Ipopt |
+| `with_shocks` | `(p::Params, overrides::Dict{Symbol,Any}) -> Params` | Deep-copies `p` and applies level overrides |
+| `example` | `() -> (baseline=Simulation, sim1=Simulation)` | Reproduces the two runs below and prints a summary |
+
+`solve`'s `converged` is `true` for JuMP termination statuses `OPTIMAL`,
+`LOCALLY_SOLVED`, or `ALMOST_LOCALLY_SOLVED` (Ipopt reports "Solved To Acceptable
+Level" — `ALMOST_LOCALLY_SOLVED` — for both runs below at default tolerances); `status`
+is the raw termination status as a string.
+
+The household saving rate, previously a bare literal (`0.09305`) inside the
+`closuremp` constraint, is now `Params.mps0`; the exchange rate, previously a
+module-level scalar, is now `Params.er`. Both are shockable via `with_shocks` like any
+other parameter.
 
 ---
 
@@ -100,6 +150,13 @@ sim1.y        # private GDP in Simulation 1
 |---|-------------|--------|
 | Baseline | Replicates 1979-80 Cameroon equilibrium | — |
 | Simulation 1 | Public investment in subsistence agriculture | `k0[:agsubsist] × 1.10` |
+
+### Tests
+
+`test/runtests.jl` (`julia --project=. test/runtests.jl`) checks that the baseline
+reproduces the base-year data and that `sim1` matches `test/reference.json` — a
+snapshot of the original, pre-refactor script's output — to 1e-6 relative on every
+value.
 
 ---
 

@@ -8,74 +8,84 @@ A static, single-country Computable General Equilibrium (CGE) model of Cameroon,
 1979-80 national accounts and input-output table (Davis-De Melo-Robinson framework). Implemented in
 Julia with JuMP (algebraic modelling) and Ipopt (interior-point NLP solver). The entire model —
 sets, calibration, the model function, and two simulation runs — lives in the single file `cge.jl`.
-See `README.md` for the full equation-by-equation description of the economics.
+See `README.md` for the full equation-by-equation description of the economics and for the current
+function-level API.
+
+**`eps-integration` branch (do not merge into `main`'s history without review):** `cge.jl` was
+refactored from a top-to-bottom script with module-level mutable globals into a module
+(`CGECameroon`) with **no include-time solves and no module-level mutable parameter state**, so it
+can be embedded safely in a long-lived, multi-request host process (the Economic Policy Simulator
+app includes this file inside its own wrapper module). Every equation is mathematically identical to
+the pre-refactor script — see `test/runtests.jl`, which checks the refactor bit-for-bit against a
+snapshot of the original script's output (`test/reference.json`).
 
 ## Running the model
 
-There is no `Project.toml`/`Manifest.toml` in the repo, so dependencies are not pinned. Install once
-per environment:
+`Project.toml`/`Manifest.toml` now pin `XLSX`, `JuMP`, `Ipopt` (added via `Pkg.add` inside this
+repo's own environment — see `git log` on `eps-integration`). From the repo root:
 
 ```julia
-import Pkg; Pkg.add(["XLSX", "JuMP", "Ipopt"])
-```
-
-Then, from the repo root (data is loaded via a path relative to the script's own location, so the
-working directory doesn't matter, but the include path does):
-
-```julia
+import Pkg; Pkg.activate(@__DIR__)
 include("cge.jl")
+using .CGECameroon
+baseline, sim1 = CGECameroon.example()   # loads data, calibrates, solves both runs, prints a summary
 ```
 
-**Compatibility note (verified against Julia 1.12 / current JuMP & Ipopt):** `cammodel()` builds the
+Or drive it step by step — see README.md's "API" table for `load_data`, `calibrate`, `solve`,
+`with_shocks`, `example`.
+
+**Compatibility note (verified against Julia 1.12 / current JuMP & Ipopt):** `solve()` builds the
 model with `Model(Ipopt.Optimizer)`. An earlier version of this script used the pre-1.0 JuMP API
 `Model(with_optimizer(Ipopt.Optimizer))`, which raises `UndefVarError: with_optimizer not defined` on
-any current JuMP version — that's been fixed. The rest of the script (including `@NLconstraints`/
+any current JuMP version — that's been fixed. The rest of the model (including `@NLconstraints`/
 `@NLobjective`, still legacy-supported) runs unmodified and both `baseline` and `sim1` solve
-successfully ("Solved To Acceptable Level").
+successfully ("Solved To Acceptable Level", i.e. JuMP termination status `ALMOST_LOCALLY_SOLVED`,
+which `solve()` treats as converged alongside `OPTIMAL`/`LOCALLY_SOLVED`).
 
-The README's "Running the model" section refers to the file as `camcge.jl` — the actual filename in
-this repo is `cge.jl`.
+The README's "Running the model" section used to refer to the file as `camcge.jl` — the actual
+filename in this repo is, and always was, `cge.jl`.
 
-No test suite, linter, or build process exists in this repo.
+`test/runtests.jl` is the test suite (`julia --project=. test/runtests.jl`); there is no linter or
+build process.
 
 ## Architecture
 
-`cge.jl` executes top-to-bottom as a script, in four stages that must stay in this order:
+`cge.jl` (module `CGECameroon`) is organised as four functions, in the same four stages the
+pre-refactor script ran top-to-bottom (the order is preserved because later stages depend on earlier
+ones — don't reorder without checking what each later block reads):
 
-1. **Sets and empty parameter containers** (~L27-114): `SEC` (11 sectors), `IT`/`ITN` (traded /
-   non-traded split), `lc` (3 labour categories). All CGE parameters (`delta`, `ac`, `rhoc`, `rhot`,
-   `gamma`, `ad`, `alphl`, `cles`, etc.) are declared as empty `Dict()`s at module scope here and
-   populated later — they are genuine globals, not passed as function arguments.
+1. **Sets** (module-level `const`s at the top): `SEC` (11 sectors), `IT`/`ITN` (traded / non-traded
+   split), `LC` (3 labour categories, was `lc`). These are structural (Cameroon-only, hardcoded), not
+   scenario parameters, so they stay as plain constants — every function reads them off `RawData`/
+   `Params`, not off these globals directly.
 
-2. **Data loading** (~L139-180): reads fixed cell ranges from `data/camdata.xlsx` (sheets `iotable`,
-   `imat`, `wagedist`, `employment`, `miscellaneous`) into `Dict`s keyed by `(sector, sector)` or
-   `(sector, labour)` tuples. Row order in the `miscellaneous` sheet (`rowz`) must match the sheet's
-   actual layout — there's no header-based lookup.
+2. **`load_data(path) -> RawData`**: reads fixed cell ranges from the workbook at `path` (sheets
+   `iotable`, `imat`, `wagedist`, `employment`, `miscellaneous`) into `Dict`s keyed by
+   `(sector, sector)` or `(sector, labour)` tuples, returned as a `RawData` (plus the sets). Row order
+   in the `miscellaneous` sheet (`rowz`) must match the sheet's actual layout — there's still no
+   header-based lookup.
 
-3. **Calibration** (~L188-273): closed-form algebra that backs out share/shift parameters (`delta`,
-   `ac`, `gamma`, `at`, `ad`, `alphl`, ...) so the model reproduces the base-year SAM exactly. Several
-   quantities are computed twice deliberately (e.g. `x0`/`ac` before and after `ad` is derived) to
-   maintain internal consistency — this is order-dependent; don't reorder blocks without checking
-   what each later block depends on.
+3. **`calibrate(raw::RawData) -> Params`**: closed-form algebra that backs out share/shift parameters
+   (`delta`, `ac`, `gamma`, `at`, `ad`, `alphl`, ...) so the model reproduces the base-year SAM
+   exactly, returned as a `Params` (a plain mutable struct holding every calibrated parameter and
+   closure value — including `mps0`, the household saving rate promoted out of a bare literal, and
+   `er`, the exchange rate). Several quantities are computed twice deliberately (e.g. `x0`/`ac` before
+   and after `ad` is derived) to maintain internal consistency, exactly as in the original.
 
-4. **`cammodel()`** (~L283-507): builds a fresh JuMP `Model`, declares ~36 endogenous variable
-   groups, ~30 `@NLconstraint` equation blocks (price, production/factor, trade (Armington/CET),
-   demand, and closure-rule blocks — see the README's "Key equations" table), sets a dummy objective
-   (`Min 1`) so the solve is a pure feasibility problem, calls `JuMP.optimize!`, extracts all
-   `JuMP.value.(...)` results, and returns them as a large tuple. **It reads the calibrated globals
-   from stage 3 as constants** (`ad`, `alphl`, `delta`, `ac`, `rhoc`, `rhot`, `gamma`, `at`, `io`,
-   `imat`, `kio`, `cles`, `gles`, `dstr`, `itax`, `tm0`, `k0`, `ls0`, `fsav0`, `gdtot0`, ...) rather
-   than taking them as arguments.
+4. **`solve(p::Params; silent=true, tol=1e-8, max_iter=3000) -> (sim, status, converged, iterations,
+   elapsed)`**: builds a fresh JuMP `Model` reading every parameter from `p` (never from a global),
+   declares ~36 endogenous variable groups, ~30 `@NLconstraint` equation blocks (price,
+   production/factor, trade (Armington/CET), demand, and closure-rule blocks — see the README's "Key
+   equations" table), sets a dummy objective (`Min 1`) so the solve is a pure feasibility problem,
+   calls `set_silent`/sets Ipopt `tol`/`max_iter`, calls `JuMP.optimize!`, and extracts all
+   `JuMP.value.(...)` results into a `Simulation`.
 
-Results from each call to `cammodel()` are wrapped in a `Simulation` struct (all fields `::Any`,
-since `JuMP.value.()` returns `DenseAxisArray`s). `baseline` is solved directly from calibrated
-parameters. `sim1` is produced by **mutating a global parameter** (`k0[:agsubsist] = 1.10 * k0[:agsubsist]`)
-and calling `cammodel()` again — this is the pattern for adding any new counterfactual: mutate the
-relevant global parameter/closure value, call `cammodel()`, wrap the result in a new `Simulation`.
-Because closure rules (`closurek`, `closurep`, `closurel`, `closuret`, `closuref`, `closuremp`,
-`closureg`, ...) fix most parameters to their `*0` base-year values by default, a new scenario
-typically means changing one of those `*0` globals (or editing a `closure*` constraint directly)
-before re-solving.
+`with_shocks(p::Params, overrides::Dict{Symbol,Any}) -> Params` replaces the old "mutate a global,
+call `cammodel()` again" pattern: it returns a `deepcopy` of `p` with `overrides` applied (a scalar
+replaces a scalar field; a `Dict{Symbol,<:Real}` merges new levels into a per-sector/per-labour
+field), so `p` itself is never mutated and two scenarios (even solved back to back, or from two
+concurrent callers) cannot leak into each other. `example()` reproduces the original script's
+include-time `baseline`/`sim1` runs on demand.
 
 ## Data
 
