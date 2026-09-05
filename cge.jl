@@ -249,11 +249,36 @@ function _bool(v, sheet::AbstractString, what::AbstractString)
     error("load_data: sheet `$sheet`, $what: expected TRUE or FALSE, got $(repr(v))")
 end
 
+"""
+    _sheet(xf, sheet) -> Matrix
+
+The whole of one worksheet as a matrix.
+
+`ws[:]` reads the rectangle the file's own `<dimension>` tag DECLARES, on trust. Some
+writers stamp a placeholder `<dimension ref="A1"/>` on every sheet regardless of what it
+actually holds -- openxlsx does, so every R-built country workbook under `data/` does --
+and then a workbook whose cell data is perfectly intact reads as ONE CELL per sheet, and
+`load_data` dies on the first header lookup ("sheet `sectors` needs a `traded` column")
+without ever seeing the data. Recompute the true extent from the cells themselves (a row
+scan, which does not consult the tag) whenever the declared one is too small.
+"""
 function _sheet(xf, sheet::AbstractString)
     sheet in XLSX.sheetnames(xf) ||
         error("load_data: workbook has no `$sheet` sheet (its sheets are " *
               join(XLSX.sheetnames(xf), ", ") * ")")
-    return xf[sheet][:]
+    ws = xf[sheet]
+    nrow, ncol = 0, 0
+    for r in XLSX.eachrow(ws)
+        nrow = max(nrow, XLSX.row_number(r))
+        for c in keys(r.rowcells)
+            ncol = max(ncol, c)
+        end
+    end
+    dim = XLSX.get_dimension(ws)
+    if nrow > XLSX.row_number(dim.stop) || ncol > XLSX.column_number(dim.stop)
+        XLSX.set_dimension!(ws, XLSX.CellRange(XLSX.CellRef(1, 1), XLSX.CellRef(nrow, ncol)))
+    end
+    return ws[:]
 end
 
 """
@@ -340,7 +365,7 @@ function _read_scalars(xf, LCg::Vector{Symbol})
     wa0 = Dict{Symbol,Float64}(l => get(WA0, l, 1.0) for l in LCg)
     "scalars" in XLSX.sheetnames(xf) || return wa0, scalars
 
-    t = xf["scalars"][:]
+    t = _sheet(xf, "scalars")
     h = _headers(t)
     for k in (:name, :value)
         haskey(h, k) || error("load_data: sheet `scalars` needs a `$k` column")
@@ -699,14 +724,49 @@ function _interp_params(base::Params, target::Params, frac::Float64)
 end
 
 """
+Initial Ipopt barrier parameters (`mu_init`), tried in order until one converges.
+
+`1e-9` is right whenever the start point is already (near) a solution, which is the normal
+case here -- the base year for a `solve(calibrate(...))`, or the cached baseline for a
+warm-started shock -- and it turns the solve into what it really is, a Newton solve of a
+square system: the 30-sector country databases under `data/` go from a median 120 Ipopt
+iterations to 2. It is a poor choice when the data are internally inconsistent and Ipopt
+genuinely has to travel (a workbook whose savings-investment identity does not close), and
+there the barrier's globalisation is what gets it there -- so retry once, higher. Only a
+FAILED solve pays for the second attempt; across all 376 country databases the ladder costs
+nothing on 371 of them and recovers 3 of the remaining 5.
+"""
+const MU_INIT_LADDER = (1e-9, 1e-3)
+
+"""
     _solve_once(P::Params; silent, tol, max_iter, start) -> (sim, status, converged, iterations, elapsed)
+
+Solves `P` with `_solve_attempt`, walking `MU_INIT_LADDER` until one attempt converges;
+returns that attempt's result (or the last attempt's, if none did) with `elapsed` summed
+over every attempt made.
+"""
+function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::Int=3000,
+                     start::Union{Nothing,Simulation}=nothing)
+    local sim, status, converged, iterations
+    total_elapsed = 0.0
+    for mu_init in MU_INIT_LADDER
+        sim, status, converged, iterations, elapsed =
+            _solve_attempt(P; silent, tol, max_iter, start, mu_init)
+        total_elapsed += elapsed
+        converged && break
+    end
+    return sim, status, converged, iterations, total_elapsed
+end
+
+"""
+    _solve_attempt(P::Params; silent, tol, max_iter, start, mu_init) -> (sim, status, converged, iterations, elapsed)
 
 Builds and solves one JuMP model from `P` -- the actual model definition (was the whole
 body of `solve` before warm-starting/homotopy were added). `start`, if given, seeds every
 variable's start value from that `Simulation` instead of `P`'s base-year `*0` data.
 """
-function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::Int=3000,
-                     start::Union{Nothing,Simulation}=nothing)
+function _solve_attempt(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::Int=3000,
+                        start::Union{Nothing,Simulation}=nothing, mu_init::Float64=1e-9)
     SEC, IT, ITN, LC = P.SEC, P.IT, P.ITN, P.LC
     io, imat, wdist, xle, alphl = P.io, P.imat, P.wdist, P.xle, P.alphl
     depr, rhoc, rhot, eta   = P.depr, P.rhoc, P.rhot, P.eta
@@ -725,21 +785,54 @@ function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::
     silent && set_silent(cgecam)
     set_optimizer_attribute(cgecam, "tol", tol)
     set_optimizer_attribute(cgecam, "max_iter", max_iter)
-    # `bound_relax_factor` (default 1e-8): raised to 1e-5 because this model now has
-    # ~20 variables genuinely FIXED at exactly 0 (see the "STRUCTURALLY ZERO" block
-    # below) -- Ipopt's own doc for this option describes exactly that situation ("if
-    # too many bounds are exactly satisfied, this can cause problems for the
-    # algorithm"). Verified necessary: with the structurally-zero cells fixed but this
-    # left at Ipopt's default (or even at 1e-6), the baseline solve itself
-    # intermittently reports a spurious LOCALLY_INFEASIBLE even though the returned
-    # point is a perfectly good solution (every real equation satisfied to high
-    # precision) -- 1e-5 was the smallest value that converged reliably across repeated
-    # checks. Still tiny: every fixed cell lands within ~1e-8 of its true value (see
-    # test/runtests.jl's `skip_cell`, which excludes exactly those cells from the
-    # reference.json check), and every other variable sits comfortably off its bound in
-    # equilibrium, so this is a no-op for them -- confirmed 0 relative difference on
-    # every non-structurally-zero cell.
-    set_optimizer_attribute(cgecam, "bound_relax_factor", 1e-5)
+    # -------------------------------------------------------------------------
+    # Ipopt's THREE ABSOLUTE bound constants, all of which are unit-dependent and were
+    # implicitly calibrated to Cameroon's billion-CFAF magnitudes (sector outputs 30-400,
+    # smallest positive base-year cell 0.023). A generic workbook in billion USD (DATA.md
+    # §5) runs from ~1e2 down to ~1e-11 in the same columns, and at that scale each of
+    # them silently destroys the problem:
+    #
+    #  * `bound_relax_factor` relaxes every bound by `factor * max(1, |bound|)`, i.e. by
+    #    the factor itself for the ~1e-6-scale bounds here. At 1e-5 that lets every
+    #    quantity go to -9e-6 -- negligible next to Cameroon's 0.023 floor, but larger
+    #    than whole sectors' output in a small-country USD workbook, and `m^(-rhoc)` /
+    #    `xxd^(-rhoc)` / `labd^alphl` at a NEGATIVE argument is a NaN, which Ipopt reports
+    #    as a restoration failure (the `OTHER_ERROR` half of the batch failures). Cut to
+    #    1e-12: the bounds below are now strictly below every base-year value (see `qlb`),
+    #    so nothing needs relaxing away from a real conflict any more -- 1e-5 was only
+    #    ever needed because the `fix`ed cells were in conflict with a 1e-6 lower bound,
+    #    and that conflict is gone. It must stay strictly POSITIVE, though: at exactly 0
+    #    the `fix`ed cells keep `lb == ub`, Ipopt's default
+    #    `fixed_variable_treatment = "make_parameter"` removes them from the problem, and
+    #    what is left has one more equation than free variable (Walras' law makes one of
+    #    the ~30 equation blocks redundant, so the system is consistent but square-plus-
+    #    one). Ipopt reports "Too few degrees of freedom", falls back into the restoration
+    #    phase and exits `Restoration Failed` on a point whose NLP error is 1e-11 --
+    #    verified on test/synthetic_data.jl's 3-sector fixture, which is small enough for
+    #    the count to tip over.
+    #  * `bound_push`/`bound_frac` move the INITIAL point to at least
+    #    `bound + kappa * max(1, |bound|)`, i.e. at least `kappa = 0.01` away from zero.
+    #    Every start value below 0.01 -- 38% of all cells in the median med30 workbook,
+    #    100% of them for a small economy -- is therefore thrown away and replaced by
+    #    0.01 before the first iteration, so the solve does not start at the base year at
+    #    all. Set to 1e-12: the base-year start is already strictly inside every bound.
+    # -------------------------------------------------------------------------
+    set_optimizer_attribute(cgecam, "bound_relax_factor", 1e-12)
+    set_optimizer_attribute(cgecam, "bound_push",  1e-12)
+    set_optimizer_attribute(cgecam, "bound_frac",  1e-12)
+    # `mu_init` (default 0.1) is the initial barrier parameter, and it is the fourth
+    # absolute constant with the same problem: the barrier contributes `mu/(x - lb)` to
+    # each variable's dual, so a cell whose base value is 1e-11 enters the KKT system
+    # with a multiplier of order 1e10 and the dual-infeasibility test can never be met,
+    # however feasible the point is (Ipopt reports `NUMERICAL_ERROR` / "Error in step
+    # computation" or wanders off a perfectly good start). This model has NO objective
+    # (`Min 1`), so the barrier buys nothing at all -- every feasible point is a global
+    # optimum, and the only job left is to solve a square system of equations from a
+    # start value that is already interior by six orders of magnitude (`qlb`). Starting
+    # at 1e-9 makes the first iteration an essentially pure Newton step on the
+    # equalities, which is what this problem actually is. See `MU_INIT_LADDER` for the
+    # one case that wants a bigger barrier and how `_solve_once` retries for it.
+    set_optimizer_attribute(cgecam, "mu_init", mu_init)
     # NOTE on Ipopt tuning (see the exploration report and test/robustness_grid.jl): the
     # obvious feasibility-problem knob, `mu_strategy = "adaptive"`, was tried and rejected --
     # it actually breaks the *baseline* solve (LOCALLY_INFEASIBLE instead of
@@ -750,77 +843,129 @@ function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::
     # LOCALLY_INFEASIBLE cases -- see `solve`'s docstring.
 
     # -------------------------------------------------------------------------
+    # BASE-YEAR LEVELS
+    #
+    # The base-year level of every variable the `*0` data does not already name, derived
+    # from the equation that determines it (named in the comment). This is the point
+    # `calibrate` makes an exact solution of every equation, and two things read it: the
+    # cold start value, and -- new -- each variable's LOWER BOUND (see `qlb`).
+    #
+    # Eleven of these had no start value at all before (`start = nothing`, i.e. Ipopt's
+    # default 0, immediately pushed to `bound_push = 0.01` before the first iteration).
+    # That was harmless in Cameroon's units, where 0.01 is a rounding error next to the
+    # true values; in a billion-USD workbook 0.01 is larger than most of them.
+    # -------------------------------------------------------------------------
+    p0        = Dict(i => 1.0 for i in SEC)                                 # absorption1/2: p0*x0 == x0
+    pk0       = Dict(i => sum(p0[j]*imat[j,i] for j in SEC) for i in SEC)   # pkdef
+    px0       = Dict(i => (pd0[i]*xxd0[i] + pe0[i]*e0[i])/xd0[i] for i in SEC)  # sales
+    gd0       = Dict(i => gles[i]*gdtot0 for i in SEC)                      # gdeq
+    deprecia0 = sum(depr[i]*pk0[i]*k0[i] for i in SEC)                      # depreq
+    indtax0   = sum(itax[i]*px0[i]*xd0[i] for i in SEC)                     # indtaxdef
+    hhsav0    = mps0*(1 - td0)*y0                                           # hhsaveq
+    govsav0   = gr0 - sum(p0[i]*gd0[i] for i in SEC)                        # gruse
+    savings0  = hhsav0 + govsav0 + deprecia0 + fsav0*er                     # totsav
+    dstval0   = sum(dst0[j]*p0[j] for j in SEC)
+    dk0       = Dict(i => pk0[i] > 0 ? kio[i]*(savings0 - dstval0)/pk0[i] : 0.0
+                     for i in SEC)                                          # prodinv
+    omega0    = prod(cd0[i]^cles[i] for i in SEC if cles[i] > 0.0)          # obj
+
+    # -------------------------------------------------------------------------
     # Start-value helpers: read from `start` (a previously-solved Simulation, typically the
-    # cached baseline) when given, otherwise fall back to `default` (the base-year `*0` data,
-    # or `nothing` for the handful of variables the original script never seeded).
+    # cached baseline) when given, otherwise fall back to `default` (the base-year level).
     # -------------------------------------------------------------------------
     sv0(field::Symbol, default) = start === nothing ? default : getfield(start, field)
     sv1(field::Symbol, i, default) = start === nothing ? default : getfield(start, field)[i]
     sv2(field::Symbol, i, l, default) = start === nothing ? default : getfield(start, field)[i, l]
 
     # -------------------------------------------------------------------------
-    # DECISION VARIABLES  (strictly positive via lower bound 1e-6, except where noted)
+    # DECISION VARIABLES
     #
-    # `hhsav`, `govsav` and `fsav` are declared FREE. All three are accounting residuals
-    # that a perfectly ordinary base year can show as negative -- a government running a
-    # deficit, an economy running a trade surplus, a household dissaving -- and a `>= 1e-6`
-    # bound on them made every such dataset infeasible rather than merely unusual (the
-    # identities analysis' §9 pitfalls 1a-1c). `td` is free for the same reason plus one
-    # more: `closuretd` pins it to `td0`, which is 0 whenever there is no direct tax, and
-    # a bound of 1e-6 against an equation demanding exactly 0 is the bound-vs-equation
-    # conflict the "STRUCTURALLY ZERO" block below exists to avoid. Ipopt's
-    # `bound_relax_factor` (set above) is unaffected: it relaxes bounds that exist, and
-    # these four now have none.
+    # LOWER BOUNDS ARE RELATIVE (`qlb`), not the absolute `1e-6` this model used to give
+    # every variable. That literal is a *quantity in the data's own units*: for Cameroon
+    # (billion CFAF, smallest positive base-year cell 0.023) it sits ~1e-8 below every
+    # real value and never binds, but a generic workbook in billion USD (DATA.md §5) has
+    # legitimate cells at 1e-11 -- tiny government-consumption or employment shares of a
+    # small economy -- and there the bound EXCLUDES THE BASE YEAR ITSELF. That is the same
+    # bound-vs-equation conflict the "STRUCTURALLY ZERO" block below fixes for cells an
+    # equation forces to exactly 0, only here for cells an equation forces to something
+    # merely small; 170 of the 188 30-sector country databases have at least one.
+    # `qlb(v) = 1e-6*v` cannot: it is a millionth of the variable's own base level, so the
+    # base point is a million times clear of it, no realistic shock reaches it, and it is
+    # unit-free. A base level of 0 gives a bound of 0 (every such cell is either `fix`ed
+    # below, or appears only linearly, so strict positivity is not needed for it).
+    #
+    # NINE VARIABLES ARE FREE. `hhsav`, `govsav`, `fsav` and `td` already were: they are
+    # accounting residuals or a tax rate that a perfectly ordinary base year can show as
+    # negative or exactly zero -- a government running a deficit, an economy running a
+    # trade surplus, a household dissaving, no direct tax -- and a `>= 1e-6` bound made
+    # every such dataset infeasible rather than merely unusual (the identities analysis'
+    # §9 pitfalls 1a-1c). The same argument covers five more, each of which is likewise
+    # pinned or defined outright by one equation, so a lower bound on it can only turn a
+    # satisfiable system infeasible, never add information:
+    #
+    #   mps    (closuremp: mps == mps0) -- `mps0 < 0` wherever the household consumes more
+    #          than its net value added, which is the norm once remittances, aid or
+    #          transfers the model does not carry are what finance the gap: 86 of the 188
+    #          30-sector country databases, and ALL 86 failed. This alone accounts for 69
+    #          of the 71 `LOCALLY_INFEASIBLE` cold solves in the batch check. Note freeing
+    #          `hhsav` without freeing `mps` bought nothing -- `hhsaveq` ties them.
+    #   tm[i]  (closuret: tm[it] == tm0[it]) -- a zero tariff line is ordinary (186 of 188
+    #          databases have at least one zero-tariff traded sector); this is `td`'s case
+    #          exactly, and it is also a policy instrument that a shock may set negative.
+    #   tariff, indtax, gr (tariffdef / indtaxdef / greq) -- revenue aggregates, and net
+    #          indirect taxes are NEGATIVE wherever production subsidies dominate (12 of
+    #          188 databases; `gr` follows it negative in 7).
     # -------------------------------------------------------------------------
+    qlb(v) = v > 0 ? 1e-6 * v : 0.0
     @variables cgecam begin
         # Prices
-        pd[i in SEC]  >= 1e-6, (start = sv1(:pd, i, pd0[i]))   # Domestic goods price
-        pm[i in SEC]  >= 1e-6, (start = sv1(:pm, i, pm0[i]))   # Domestic price of imports
-        pe[i in SEC]  >= 1e-6, (start = sv1(:pe, i, pe0[i]))   # Domestic price of exports
-        pk[i in SEC]  >= 1e-6, (start = sv1(:pk, i, pd0[i]))   # Capital rental rate by sector
-        px[i in SEC]  >= 1e-6, (start = sv1(:px, i, pd0[i]))   # Average output price (net of indirect tax)
-        p[i in SEC]   >= 1e-6, (start = sv1(:p, i, pd0[i]))    # Composite (Armington) goods price
-        pva[i in SEC] >= 1e-6, (start = sv1(:pva, i, pva0[i])) # Value-added price
-        pwm[i in SEC] >= 1e-6, (start = sv1(:pwm, i, pwm0[i])) # World import price (foreign currency)
-        pwe[i in SEC] >= 1e-6, (start = sv1(:pwe, i, pwe0[i])) # World export price (foreign currency)
-        tm[i in SEC]  >= 1e-6, (start = sv1(:tm, i, tm0[i]))   # Tariff rates
+        pd[i in SEC]  >= qlb(pd0[i]),  (start = sv1(:pd, i, pd0[i]))   # Domestic goods price
+        pm[i in SEC]  >= qlb(pm0[i]),  (start = sv1(:pm, i, pm0[i]))   # Domestic price of imports
+        pe[i in SEC]  >= qlb(pe0[i]),  (start = sv1(:pe, i, pe0[i]))   # Domestic price of exports
+        pk[i in SEC]  >= qlb(pk0[i]),  (start = sv1(:pk, i, pk0[i]))   # Capital rental rate by sector
+        px[i in SEC]  >= qlb(px0[i]),  (start = sv1(:px, i, px0[i]))   # Average output price (net of indirect tax)
+        p[i in SEC]   >= qlb(p0[i]),   (start = sv1(:p, i, p0[i]))     # Composite (Armington) goods price
+        pva[i in SEC] >= qlb(pva0[i]), (start = sv1(:pva, i, pva0[i])) # Value-added price
+        pwm[i in SEC] >= qlb(pwm0[i]), (start = sv1(:pwm, i, pwm0[i])) # World import price (foreign currency)
+        pwe[i in SEC] >= qlb(pwe0[i]), (start = sv1(:pwe, i, pwe0[i])) # World export price (foreign currency)
+        tm[i in SEC],                  (start = sv1(:tm, i, tm0[i]))   # Tariff rates (free; see above)
 
         # Production quantities
-        x[i in SEC]   >= 1e-6, (start = sv1(:x, i, x0[i]))     # Composite good supply (Armington)
-        xd[i in SEC]  >= 1e-6, (start = sv1(:xd, i, xd0[i]))   # Domestic output by sector
-        xxd[i in SEC] >= 1e-6, (start = sv1(:xxd, i, xxd0[i])) # Domestic sales (output minus exports)
-        e[i in SEC]   >= 1e-6, (start = sv1(:e, i, e0[i]))     # Exports by sector
-        m[i in SEC]   >= 1e-6, (start = sv1(:m, i, m0[i]))     # Imports by sector
+        x[i in SEC]   >= qlb(x0[i]),   (start = sv1(:x, i, x0[i]))     # Composite good supply (Armington)
+        xd[i in SEC]  >= qlb(xd0[i]),  (start = sv1(:xd, i, xd0[i]))   # Domestic output by sector
+        xxd[i in SEC] >= qlb(xxd0[i]), (start = sv1(:xxd, i, xxd0[i])) # Domestic sales (output minus exports)
+        e[i in SEC]   >= qlb(e0[i]),   (start = sv1(:e, i, e0[i]))     # Exports by sector
+        m[i in SEC]   >= qlb(m0[i]),   (start = sv1(:m, i, m0[i]))     # Imports by sector
 
         # Factors
-        k[i in SEC]            >= 1e-6, (start = sv1(:k, i, k0[i]))     # Capital stock by sector
-        wa[l in LC]            >= 1e-6, (start = sv1(:wa, l, wa0[l]))   # Economy-wide wage by labour type
-        ls[l in LC]            >= 1e-6, (start = sv1(:ls, l, ls0[l]))   # Labour supply by category
-        labd[i in SEC, l in LC] >= 1e-6, (start = sv2(:labd, i, l, xle[i,l])) # Employment (sector × labour type)
+        k[i in SEC]            >= qlb(k0[i]),      (start = sv1(:k, i, k0[i]))     # Capital stock by sector
+        wa[l in LC]            >= qlb(wa0[l]),     (start = sv1(:wa, l, wa0[l]))   # Economy-wide wage by labour type
+        ls[l in LC]            >= qlb(ls0[l]),     (start = sv1(:ls, l, ls0[l]))   # Labour supply by category
+        labd[i in SEC, l in LC] >= qlb(xle[i,l]),  (start = sv2(:labd, i, l, xle[i,l])) # Employment (sector × labour type)
 
         # Demand aggregates
-        int[i in SEC]  >= 1e-6, (start = sv1(:int, i, int0[i]))  # Intermediate input demand
-        cd[i in SEC]   >= 1e-6, (start = sv1(:cd, i, cd0[i]))    # Private consumption demand
-        gd[i in SEC]   >= 1e-6, (start = sv1(:gd, i, nothing))    # Government consumption demand
-        id[i in SEC]   >= 1e-6, (start = sv1(:id, i, id0[i]))    # Investment demand by sector of origin
-        dst[i in SEC]  >= 1e-6, (start = sv1(:dst, i, dst0[i]))  # Inventory investment
-        y              >= 1e-6, (start = sv0(:y, y0))             # Private GDP (value added minus depreciation)
-        gr             >= 1e-6, (start = sv0(:gr, gr0))           # Government revenue
-        tariff         >= 1e-6, (start = sv0(:tariff, tariff0))    # Tariff revenue
-        indtax         >= 1e-6, (start = sv0(:indtax, nothing))    # Indirect tax revenue
-        duty           >= 1e-6, (start = sv0(:duty, nothing))      # Export duty revenue
-        gdtot          >= 1e-6, (start = sv0(:gdtot, nothing))     # Total government consumption volume
-        mps            >= 1e-6, (start = sv0(:mps, nothing))       # Marginal propensity to save (households)
-        td,             (start = td0)                              # Household direct-tax rate (free; see above)
-        hhsav,          (start = sv0(:hhsav, nothing))             # Household savings (free)
-        govsav,         (start = sv0(:govsav, nothing))            # Government savings (budget surplus/deficit; free)
-        deprecia       >= 1e-6, (start = sv0(:deprecia, nothing))  # Economy-wide depreciation expenditure
-        savings        >= 1e-6, (start = sv0(:savings, nothing))   # Total savings (= total investment)
-        fsav,           (start = sv0(:fsav, fsav0))                # Foreign savings (current-account deficit; free)
-        dk[i in SEC]   >= 1e-6, (start = sv1(:dk, i, nothing))     # Investment by sector of destination
+        int[i in SEC]  >= qlb(int0[i]),  (start = sv1(:int, i, int0[i]))   # Intermediate input demand
+        cd[i in SEC]   >= qlb(cd0[i]),   (start = sv1(:cd, i, cd0[i]))     # Private consumption demand
+        gd[i in SEC]   >= qlb(gd0[i]),   (start = sv1(:gd, i, gd0[i]))     # Government consumption demand
+        id[i in SEC]   >= qlb(id0[i]),   (start = sv1(:id, i, id0[i]))     # Investment demand by sector of origin
+        dst[i in SEC]  >= qlb(dst0[i]),  (start = sv1(:dst, i, dst0[i]))   # Inventory investment
+        y              >= qlb(y0),        (start = sv0(:y, y0))            # Private GDP (value added minus depreciation)
+        gr,                               (start = sv0(:gr, gr0))          # Government revenue (free; see above)
+        tariff,                           (start = sv0(:tariff, tariff0))  # Tariff revenue (free; see above)
+        indtax,                           (start = sv0(:indtax, indtax0))  # Indirect tax revenue (free; see above)
+        duty           >= 0.0,            (start = sv0(:duty, 0.0))        # Export duty revenue
+        gdtot          >= qlb(gdtot0),    (start = sv0(:gdtot, gdtot0))    # Total government consumption volume
+        mps,                              (start = sv0(:mps, mps0))        # Household saving rate (free; see above)
+        td,                               (start = td0)                    # Household direct-tax rate (free; `closuretd` pins it, so no `start` field)
+        hhsav,                            (start = sv0(:hhsav, hhsav0))    # Household savings (free)
+        govsav,                           (start = sv0(:govsav, govsav0))  # Government savings (budget surplus/deficit; free)
+        deprecia       >= qlb(deprecia0), (start = sv0(:deprecia, deprecia0)) # Economy-wide depreciation expenditure
+        savings        >= qlb(savings0),  (start = sv0(:savings, savings0))   # Total savings (= total investment)
+        fsav,                             (start = sv0(:fsav, fsav0))      # Foreign savings (current-account deficit; free)
+        dk[i in SEC]   >= qlb(dk0[i]),    (start = sv1(:dk, i, dk0[i]))    # Investment by sector of destination
 
         # Welfare
-        omega, (start = sv0(:omega, nothing))                       # Cobb-Douglas utility (welfare indicator)
+        omega,                            (start = sv0(:omega, omega0))    # Cobb-Douglas utility (welfare indicator)
     end
 
     # -------------------------------------------------------------------------
@@ -828,9 +973,12 @@ function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::
     #
     # A number of cells are forced to exactly zero by an equation for ANY value of
     # every other parameter or variable -- not merely small, or zero only at this
-    # particular shock -- yet were given the same >= 1e-6 lower bound as every other
-    # variable above. That makes the feasibility problem inconsistent by construction
-    # (the equation demands 0, the bound forbids anything below 1e-6): Ipopt tolerates
+    # particular shock. These are the cells `qlb` above cannot help: their base level is
+    # exactly 0, so a relative bound is 0 too, and the CES/Cobb-Douglas powers they sit
+    # in still need an argument that is strictly positive (or, for four of them, nothing
+    # in the model pins them at all). They used to carry the same absolute >= 1e-6 lower
+    # bound as every other variable, which made the feasibility problem inconsistent by
+    # construction (the equation demands 0, the bound forbids anything below 1e-6): Ipopt tolerates
     # the resulting ~1e-6 constraint violation near the base-year start point (see
     # test/reference.json, where these cells sit at ~9.9e-7, just under the bound), but
     # it is the root cause of the spurious LOCALLY_INFEASIBLE reports on shocked solves
@@ -882,11 +1030,13 @@ function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::
     #   pe[itn]  -- appears only in sales[itn]: px*xd == pd*xxd + pe[itn]*e[itn]
     #   pm[itn], pwe[itn], tm[itn] -- appear in no equation at all
     #
-    # NOTE: tm[services] is a different case, deliberately NOT touched here: tm0
-    # happens to be 0 in this data's base year, but tm[services] is a live,
-    # shockable policy instrument (tariff scenarios on `services` set tm0[services] >
-    # 0), not a structural zero for any parameter value -- fixing it would silently
-    # break every such shock. Likewise id0/dst0/cd0 having zero cells beyond the ones
+    # NOTE: a TRADED sector whose tm0 is 0 (tm[services] here; 186 of the 188 country
+    # databases have at least one) is a different case, deliberately NOT touched here:
+    # such a cell is a live, shockable policy instrument (tariff scenarios on `services`
+    # set tm0[services] > 0), not a structural zero for any parameter value -- fixing it
+    # would silently break every such shock. Declaring `tm` free (see the variables
+    # block) is what keeps `closuret == 0` satisfiable there. Likewise id0/dst0/cd0
+    # having zero cells beyond the ones
     # above (e.g. id0[:construct], id0[:bienscap]) is a base-year coincidence, not a
     # structural forcing -- imat's row for those sectors is NOT all-zero, so id there
     # can legitimately move away from 0 under a shock, and is left untouched.

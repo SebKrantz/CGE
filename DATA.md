@@ -67,10 +67,11 @@ workbook into `RawData` and carried through `Params` into every index set of the
 (`_solve_once`); the module `const`s `SEC`/`IT`/`ITN`/`LC`/`WA0`/`SCALARS` survive only as the
 defaults the legacy loader stamps on `data/camdata.xlsx`, which has no sheets of its own for them.
 
-**Signs.** `fsav0` (foreign savings) is negative for a base-year **trade surplus**, and the solved
-`govsav` (government budget balance) and `hhsav` (household saving) may likewise come out negative —
-all three variables are declared free in `_solve_once`. A base year with a surplus, a government
-deficit or household dissaving is ordinary data, not an error.
+**Signs.** `fsav0` (foreign savings) is negative for a base-year **trade surplus**; `mps0` is
+negative for a **dissaving household**; and the solved `govsav` (government budget balance),
+`hhsav` (household saving) and `indtax`/`gr` (net indirect taxes, government revenue) may likewise
+come out negative — all of them are declared free in `_solve_attempt`. See §5.5 for the full list
+and why each occurs in real data.
 
 ---
 
@@ -277,7 +278,10 @@ point. In order of computation:
    `m[i]=e[i]=0` at solve time regardless of what the sheet says (`fix(...)`, cge.jl:646–652), so a
    non-zero value here would still corrupt `xxd0 = xd0 − e0` in calibration even though the solved
    model discards it.
-5. **Non-negative taxes.** `tm0[i]`, `itax[i]` (and the hardcoded `te[i]=0`) are all `≥ 0` throughout.
+5. **Non-negative taxes.** `tm0[i]`, `itax[i]` (and the hardcoded `te[i]=0`) are all `≥ 0` throughout
+   *in this Cameroon dataset*. Neither is required by the model: `tm` and `indtax`/`gr` are free
+   variables, so a zero-rated tariff line or a sector with net production subsidies (`itax[i] < 0`)
+   is representable — see §5.5.
 6. **Employment/wage-distribution zero pairing.** Wherever `xle[i,l]=0`, `alphl[l,i]` calibrates to
    0 regardless of `wdist[i,l]`, and the solved model fixes that `labd[i,l]` cell to exactly 0
    (cge.jl:592–600, 628–653). This fixing logic — like the analogous zero handling for `gd`, `cd`,
@@ -445,11 +449,25 @@ equations: the household spends and saves out of **disposable** income `(1 − t
 `closuretd` fixes `td = td0`. With `td0 = 0` every equation reduces to the pre-`n-sector` model —
 the Cameroon results are unchanged, which is what `test/reference.json` still checks bit-for-bit.
 
-`hhsav`, `govsav`, `fsav` and `td` are declared **free** in `_solve_once` (they used to carry the
-same `>= 1e-6` lower bound as every quantity variable). A base year with a **government deficit**
-(`govsav < 0`), a **trade surplus** (`fsav < 0`) or household **dissaving** (`hhsav < 0`) is
-therefore ordinary data now, rather than an infeasible model. The `savings = hhsav + govsav +
-deprecia + fsav·er` total is still bounded positive, as are all prices and quantities.
+Nine variables are declared **free** in `_solve_attempt` (they used to carry the same `>= 1e-6`
+lower bound as every quantity variable): `hhsav`, `govsav`, `fsav`, `td`, plus `mps`, `tm`,
+`tariff`, `indtax` and `gr`. Each is a rate or an accounting residual that one equation pins or
+defines outright, so a bound on it can only make a satisfiable base year infeasible. All of the
+following are therefore ordinary data now, rather than an infeasible model:
+
+| Data feature | Base-year value | Why it happens |
+|---|---|---|
+| government deficit | `govsav0 < 0` | spending exceeds tax revenue |
+| trade surplus | `fsav0 < 0` | exports exceed imports |
+| **dissaving household** | **`mps0 < 0`** | consumption exceeds net value added, because remittances / aid / transfers finance the gap and this model carries none of them (86 of the 188 30-sector country databases under `data/`) |
+| **zero tariff line** | **`tm0[i] = 0` for a traded `i`** | most tariff schedules have zero-rated lines (186 of 188 databases) |
+| **net production subsidies** | **`indtax0 < 0`, hence possibly `gr0 < 0`** | subsidies exceed indirect taxes (12 of 188 databases) |
+
+The `savings = hhsav + govsav + deprecia + fsav·er` total is still bounded positive, as are all
+prices and quantities — but their lower bound is now **relative**, a millionth of each variable's
+own base-year level, so a legitimately tiny cell (a 1e-11 government-consumption or employment
+share of a small economy in billion USD) no longer collides with it. Nothing in the model is an
+absolute quantity in the data's units any more; see the README's "Units and scale".
 
 ---
 

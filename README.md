@@ -63,15 +63,21 @@ Non-traded sectors (`construct`, `publiques`) have neither imports nor exports.
 | Capital stocks `k` | Fixed at base year `k0` |
 | World prices `pwm` | Fixed (small open economy) |
 | Labour supplies `ls` | Fixed (inelastic labour supply) |
-| Tariff rates `tm` | Fixed at base `tm0` (policy instrument) |
+| Tariff rates `tm` | Fixed at base `tm0` (policy instrument; may be 0) |
 | Foreign savings `fsav` | Fixed at base `fsav0` (negative = trade surplus) |
-| Household saving rate `mps` | Fixed at base `mps0` |
+| Household saving rate `mps` | Fixed at base `mps0` (negative = dissaving household) |
 | Household direct-tax rate `td` | Fixed at base `td0` (`0` = no direct tax) |
 | Government consumption volume `gdtot` | Fixed at base `gdtot0` |
 
-`hhsav`, `govsav`, `fsav` and `td` are declared **free** (no lower bound), so a base year with a
-government deficit, a trade surplus or household dissaving is representable; every price and
-quantity variable keeps its `>= 1e-6` bound.
+Nine variables are declared **free** (no bound at all) — `hhsav`, `govsav`, `fsav`, `td`, `mps`,
+`tm`, `tariff`, `indtax`, `gr`. Each is a rate or an accounting residual that one equation pins or
+defines outright, so a lower bound on it can never add information and can only turn a satisfiable
+base year infeasible: a government deficit, a trade surplus, a dissaving household (`mps0 < 0`), a
+zero tariff line, or net production subsidies (`indtax0 < 0`) are all perfectly ordinary in real
+data. Every other variable keeps a **relative** lower bound of a millionth of its own base-year
+level (`qlb` in `_solve_attempt`), not the absolute `1e-6` this model used to give every variable —
+that literal is a quantity in the data's own units, invisible in Cameroon's billion CFAF and larger
+than whole demand cells in a billion-USD SAM. See "Units and scale" below.
 
 ---
 
@@ -93,6 +99,24 @@ instead read as a **generic** workbook — `sectors`, `labour`, labelled `iotabl
 `fsav0`, `mps0`, `td0`, `tariff0`, `wa0_<labour code>`) — with any sector count, any
 traded/non-traded partition, any labour categories, in any order, all by header lookup. **DATA.md
 §5 is the full specification**; `test/generic_workbook.jl` is a reference writer for it.
+
+A worksheet whose `<dimension>` tag under-reports its contents is read correctly anyway: `_sheet`
+recomputes the true extent from the cells. (openxlsx, which writes the R-built country databases,
+stamps a placeholder `<dimension ref="A1"/>` on every sheet.)
+
+### Units and scale
+
+The model is **unit-free**: pick any currency unit for the whole workbook, keep `pd0 = 1`, and set
+`er` so that `fsav0 * er` is in that same unit (for a SAM already in USD, `er = 1`). Nothing in
+`_solve_attempt` is an absolute quantity any more — variable lower bounds are a millionth of each
+variable's own base level, and Ipopt's four bound/barrier constants
+(`bound_relax_factor`, `bound_push`, `bound_frac`, `mu_init`) are set to values that do not depend
+on the data's magnitude. So a 30-sector database in **billion USD**, whose sector outputs run from
+1e2 down to 1e-4 and whose smallest employment or government-consumption cells sit at 1e-11, solves
+as reliably as Cameroon's billion CFAF: across the 188 such databases under `data/`, cold solves go
+188/188 and 104 of them replicate their base year to ≤1e-6 (the other 84 are limited by a
+savings-investment residual in the data itself, not by the solver). Rescaling a workbook by a
+constant is therefore never necessary and never helps.
 
 ---
 
@@ -161,8 +185,12 @@ sim, status, converged, iterations, elapsed = solve(shocked; start = baseline)
 
 Warm-starting fixes every scenario in `test/robustness_grid.jl`'s ~60-scenario grid
 (59/59, up from 44/59 before the structural-zero fix below) and costs nothing extra (a
-warm solve takes well under 0.1s, vs. ~2s cold). `steps`-increment homotopy from the
-pre-shock `Params` (`base`) remains available for anything that somehow still fails warm:
+warm solve takes well under 0.1s, vs. ~2s cold). Since the scale-relative rework of the
+bounds and the Ipopt constants (see "Units and scale" above), that grid also converges
+59/59 **cold** — but `start` remains the right thing to pass when you have a baseline: it
+is what the fix was verified against, and it is several times faster. `steps`-increment
+homotopy from the pre-shock `Params` (`base`) remains available for anything that somehow
+still fails warm:
 
 ```julia
 sim, status, converged, iterations, elapsed =
@@ -177,7 +205,7 @@ and `e`/`m`/`pe`/`pm`/`pwe`/`tm` for the two non-traded sectors) are forced to e
 with the same `>= 1e-6` lower bound as every other variable — a hard bound-vs-equation
 conflict Ipopt could only paper over near the base-year start point (see
 `test/reference.json`, where these cells sit at ~9.9e-7, or, where nothing pins them at
-all, run away to ~1e5). `_solve_once` now fixes each such cell directly with
+all, run away to ~1e5). `_solve_attempt` now fixes each such cell directly with
 `fix(...; force = true)` and narrows the equation that used to (mis)determine it — see
 cge.jl's "STRUCTURALLY ZERO / INDETERMINATE CELLS" block for the full list and the
 equation that forces each one.
@@ -226,12 +254,15 @@ comparable tiny amount because they sum those cells (`tariff`, `govsav`) — see
 runs a reduced (~5-scenario) robustness testset confirming `start`'s warm-start fix on
 the exact cases the original bug report found.
 
-Two further testsets cover the N-sector work: a **generic-workbook round trip** (the Cameroon
+Three further testsets cover the N-sector work: a **generic-workbook round trip** (the Cameroon
 `RawData` written out in the generic layout with its sectors and labour categories reversed, re-read
 through `load_data`'s generic branch, and required to reproduce the legacy calibration and solution
-to 1e-8) and a **synthetic 3-sector / 2-labour dataset** (`test/synthetic_data.jl`) with a base-year
+to 1e-8); a **synthetic 3-sector / 2-labour dataset** (`test/synthetic_data.jl`) with a base-year
 trade surplus, a government deficit and a 5% direct tax, which calibrates and solves back to its own
-base year.
+base year; and a **real country workbook** (`test/data/SEN_2018_hybrid_med30.xlsx` — Senegal 2018,
+29 sectors, 5 labour categories, billion USD, straight out of the R exporter) which must load
+despite its placeholder `<dimension>` tags, calibrate with `mps0 < 0`, six zero-tariff traded
+sectors and eleven base-year cells below 1e-6 in its own units, and replicate its base year to 1e-6.
 
 `test/robustness_grid.jl` (`julia --project=. test/robustness_grid.jl`) is the full
 ~60-scenario grid behind that testset — see its header comment for the shock list and

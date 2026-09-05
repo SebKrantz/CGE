@@ -13,9 +13,12 @@ function-level API.
 
 **`n-sector` branch:** the model is no longer Cameroon-shaped. Sets and economy-wide scalars come
 from the data (see Architecture stages 1–2 and DATA.md §5), a household direct tax `td0` was added,
-and `hhsav`/`govsav`/`fsav`/`td` are free variables so a government deficit or a trade surplus is
-representable. With `td0 = 0` the Cameroon results are unchanged — `test/runtests.jl` still checks
-them bit-for-bit against `test/reference.json`.
+and `hhsav`/`govsav`/`fsav`/`td`/`mps`/`tm`/`tariff`/`indtax`/`gr` are free variables so a
+government deficit, a trade surplus, a dissaving household, a zero tariff line or net production
+subsidies are representable. Variable lower bounds and Ipopt's bound/barrier constants are
+**scale-relative**, not the absolute `1e-6`/`1e-5`/`0.01`/`0.1` that were implicitly calibrated to
+Cameroon's billion-CFAF magnitudes (see stage 4 below). With `td0 = 0` the Cameroon results are
+unchanged — `test/runtests.jl` still checks them bit-for-bit against `test/reference.json`.
 
 **`eps-integration` branch (do not merge into `main`'s history without review):** `cge.jl` was
 refactored from a top-to-bottom script with module-level mutable globals into a module
@@ -74,7 +77,11 @@ ones — don't reorder without checking what each later block reads):
    (`test/generic_workbook.jl` is a reference writer for it). **Legacy** (`_load_legacy`): the
    original hardcoded `camdata.xlsx` cell ranges and `MISC_ROWS` row order, byte-for-byte unchanged.
    Either way the result is `Dict`s keyed by `(sector, sector)` / `(sector, labour)` tuples plus the
-   sets, the per-labour base wages `wa0` and the economy-wide `scalars`.
+   sets, the per-labour base wages `wa0` and the economy-wide `scalars`. `_sheet` (generic path
+   only) recomputes a worksheet's true extent from its cells when the file's own `<dimension>` tag
+   under-reports it — openxlsx stamps a placeholder `<dimension ref="A1"/>` on every sheet, so every
+   R-built country workbook otherwise read as one cell per sheet and failed on the first header
+   lookup.
 
 3. **`calibrate(raw::RawData) -> Params`**: closed-form algebra that backs out share/shift parameters
    (`delta`, `ac`, `gamma`, `at`, `ad`, `alphl`, ...) so the model reproduces the base-year SAM
@@ -91,7 +98,10 @@ ones — don't reorder without checking what each later block reads):
    `steps == 1` (default) it calls `_solve_once(p; ..., start)` directly; when `steps > 1` it walks a
    linear homotopy from `base` (the pre-shock `Params`, via `_interp_params`) to `p` in `steps` equal
    increments, warm-starting each from the previous one's solution, and returns the last step's
-   result. `_solve_once` is the original model-building body: builds a fresh JuMP `Model` reading
+   result. `_solve_once` walks `MU_INIT_LADDER` — it calls `_solve_attempt` at the small barrier
+   start that suits a good start point and, only if that fails to converge, retries once at a larger
+   one for the inconsistent-data case (see the `MU_INIT_LADDER` docstring). `_solve_attempt` is the
+   original model-building body: builds a fresh JuMP `Model` reading
    every parameter from `p` (never from a global), declares ~36 endogenous variable groups, ~30
    `@NLconstraint` equation blocks (price, production/factor, trade (Armington/CET), demand, and
    closure-rule blocks — see the README's "Key equations" table), sets a dummy objective (`Min 1`) so
@@ -105,6 +115,23 @@ ones — don't reorder without checking what each later block reads):
    spurious Ipopt `LOCALLY_INFEASIBLE`). `mu_strategy = "adaptive"` was tried and rejected as a global
    default — it actually breaks the *baseline* solve.
 
+   **Nothing in the model may be an absolute number in the data's units.** `_solve_once` used to
+   carry four, all silently calibrated to Cameroon (billion CFAF; sector outputs 30–400, smallest
+   positive base-year cell 0.023): the `>= 1e-6` lower bound on every variable, Ipopt's
+   `bound_relax_factor = 1e-5`, and Ipopt's own defaults `bound_push`/`bound_frac = 0.01` and
+   `mu_init = 0.1`. A generic workbook in billion USD (DATA.md §5) spans 1e2 down to 1e-11 in the
+   same columns, and there each of the four breaks the solve outright — the bound excludes the base
+   year, the relaxation lets quantities go negative into `x^(-rhoc)` (NaN → restoration failure), the
+   push throws away every start value below 0.01, and the barrier gives 1e-11-scale cells 1e10-scale
+   duals. All four are now relative: a `qlb(v) = 1e-6*v` bound (a millionth of the variable's *own*
+   base level, computed in the new "BASE-YEAR LEVELS" block, which also supplies the eleven start
+   values that used to be missing), `bound_relax_factor`/`bound_push`/`bound_frac = 1e-12` (only
+   large enough to keep the `fix`ed cells from being eliminated as parameters, which would leave one
+   more equation than free variable — Walras' law makes one redundant) and `mu_init = 1e-9` (this is
+   a pure feasibility problem started at a point that is already a solution; the barrier buys
+   nothing). Cameroon is untouched by all of it; on the 188 30-sector country databases under
+   `data/`, cold convergence went 88/188 → 188/188 and exact base-year replication 8 → 104.
+
    **Structurally-zero / indeterminate cells (fixed, not just worked around):** right after the
    `@variables` block, `_solve_once` `fix(...; force = true)`s ~20 cells that an equation forces to
    exactly 0 (or leaves fully indeterminate) *for any parameter value* — `gd[i]`/`cd[i]`/`dst[i]` for
@@ -114,9 +141,9 @@ ones — don't reorder without checking what each later block reads):
    the block's own comment for the equation that forces each one). These previously carried the same
    `>= 1e-6` lower bound as every other variable, an inherent bound-vs-equation conflict (not a bad
    start point) that was the actual root cause of most of `test/robustness_grid.jl`'s residual
-   `LOCALLY_INFEASIBLE` cases. Fixing it, plus raising Ipopt's `bound_relax_factor` to `1e-5` (needed
-   once this many variables are genuinely fixed at 0 — see Ipopt's own doc for that option), takes the
-   grid from 44/59 to 59/59 converged warm-started. This makes `start = nothing` (cold, the default)
+   `LOCALLY_INFEASIBLE` cases. Fixing it took the grid from 44/59 to 59/59 converged warm-started
+   (and, since the scale-relative rework above, 59/59 cold as well). This makes `start = nothing`
+   (cold, the default)
    **no longer** byte-identical to the pre-fix script on these specific cells — expected, since they
    used to be wrong (lower-bound-clipped to ~9.9e-7, or, where nothing pinned them, an Ipopt runaway
    to ~1e5); `test/runtests.jl`'s reference.json check now excludes exactly these cells (plus

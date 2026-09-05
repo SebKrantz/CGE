@@ -458,4 +458,67 @@ const REFERENCE = parse_json_numeric(read(joinpath(@__DIR__, "reference.json"), 
             end
         end
     end
+
+    # A REAL country database, straight out of the R exporter that builds these from the
+    # GTAP SAMs: Senegal 2018, 29 sectors (28 traded, 1 not), 5 labour categories, in
+    # BILLION USD with `er = 1` -- the generic workbook of DATA.md §5, unmodified, exactly
+    # as it sits in `data/SEN_2018_hybrid_med30/data.xlsx`. It is here because every one of
+    # the four defects the batch check across 188 such databases turned up is present in
+    # this single file, and each used to be fatal on its own:
+    #
+    #   1. every worksheet carries a placeholder `<dimension ref="A1"/>` (openxlsx writes
+    #      one on every sheet), so `load_data` used to fail on the first header lookup
+    #      without ever reading a data cell -- `_sheet` now recomputes the true extent;
+    #   2. `mps0 = -0.138`: the household consumes more than its net value added (the SAM's
+    #      remittance and transfer inflows have nowhere to go in this model), which the
+    #      `mps >= 1e-6` bound made strictly infeasible against `closuremp`;
+    #   3. six of the 28 traded sectors have a zero tariff line, which `tm >= 1e-6` made
+    #      strictly infeasible against `closuret`;
+    #   4. eleven base-year cells are below 1e-6 IN THE DATA'S OWN UNITS (smallest
+    #      2.5e-10 -- a $0.25m employment or government-consumption cell), so the old
+    #      absolute `>= 1e-6` bound excluded the base year itself.
+    #
+    # The dataset's own accounting is exact (`si_identity_resid == 0` in its summary.json --
+    # no value-added floor was applied to it), so the base year is an exact solution of
+    # every equation and the replication check below is at 1e-6, not the 1e-3 the Cameroon
+    # baseline uses. Before these fixes this database returned `LOCALLY_INFEASIBLE`.
+    @testset "real country workbook (Senegal 2018, 29 sectors, billion USD)" begin
+        raw = CGECameroon.load_data(joinpath(@__DIR__, "data", "SEN_2018_hybrid_med30.xlsx"))
+        @test length(raw.SEC) == 29
+        @test length(raw.IT) == 28
+        @test raw.ITN == [:ELYFF]
+        @test length(raw.LC) == 5
+        @test raw.scalars[:er] == 1.0
+
+        p = CGECameroon.calibrate(raw)
+        @test p.mps0 < 0                                          # (2) household dissaving
+        @test count(i -> p.tm0[i] == 0.0, raw.IT) == 6             # (3) zero-tariff traded lines
+        base_cells = vcat([p.xd0[i] for i in raw.SEC], [p.k0[i] for i in raw.SEC],
+                          [p.cd0[i] for i in raw.SEC], [p.id0[i] for i in raw.SEC],
+                          [p.gles[i]*p.gdtot0 for i in raw.SEC],
+                          [p.xle[i,l] for i in raw.SEC for l in raw.LC],
+                          [p.e0[i] for i in raw.IT], [p.m0[i] for i in raw.IT])
+        @test count(v -> 0 < v < 1e-6, base_cells) == 11           # (4) below the old bound
+
+        sim, status, converged, iterations, elapsed = CGECameroon.solve(p)
+        @test converged
+        for i in raw.SEC
+            @test isapprox(sim.xd[i], p.xd0[i]; rtol = 1e-6)
+            @test isapprox(sim.k[i],  p.k0[i];  rtol = 1e-6)
+            @test isapprox(sim.cd[i], p.cd0[i]; rtol = 1e-6)
+        end
+        for l in raw.LC
+            @test isapprox(sim.ls[l], p.ls0[l]; rtol = 1e-6)
+        end
+        @test isapprox(sim.y,    p.y0;    rtol = 1e-6)
+        @test isapprox(sim.fsav, p.fsav0; rtol = 1e-6)
+        @test isapprox(sim.mps,  p.mps0;  rtol = 1e-6)   # negative, and reproduced
+
+        # ... and a policy shock on top of it still solves, warm-started from that baseline.
+        it1 = first(raw.IT)
+        shocked = CGECameroon.with_shocks(p,
+            Dict{Symbol,Any}(:tm0 => Dict(it1 => p.tm0[it1] + 0.05)))
+        _, _, shock_converged, = CGECameroon.solve(shocked; start = sim)
+        @test shock_converged
+    end
 end
