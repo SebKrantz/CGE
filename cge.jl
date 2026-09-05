@@ -41,17 +41,22 @@ using Ipopt
 export RawData, Params, Simulation, load_data, calibrate, solve, with_shocks, example
 
 # =============================================================================
-# SETS
+# CAMEROON DEFAULTS (legacy loader only)
 # =============================================================================
-# SEC  — all 11 production sectors
-# IT   — 9 traded sectors (subject to Armington imports and CET exports)
-# ITN  — 2 non-traded sectors (domestic supply = domestic demand, no trade)
-# LC   — 3 labour categories
+# The model itself is N-sector / L-labour-category: `calibrate` and `_solve_once` read
+# every set off the `RawData`/`Params` they are handed, never off these constants. The
+# constants survive only as the defaults `_load_legacy` stamps onto the legacy Cameroon
+# workbook, which carries no `sectors`/`labour`/`scalars` sheets of its own. A generic
+# workbook (see `load_data`) supplies all of them as data, for any sector count, any
+# traded/non-traded partition and any number of labour categories.
 #
-# These are structural (today: Cameroon-only, hardcoded) rather than scenario
-# parameters, so they stay as plain constants -- but every function below reads them
-# off `RawData`/`Params`, never off these module globals directly, so a future
-# multi-country loader only has to change `load_data`.
+# SEC  — the 11 Cameroon production sectors
+# IT   — its 9 traded sectors (subject to Armington imports and CET exports)
+# ITN  — its 2 non-traded sectors (domestic supply = domestic demand, no trade)
+# LC   — its 3 labour categories
+# WA0  — its base wage per labour category (million CFAF per 1000 workers)
+# SCALARS — its economy-wide scalars, also the fallback for any name a generic
+#           workbook's `scalars` sheet omits
 # =============================================================================
 
 const SEC = [
@@ -74,6 +79,27 @@ const ITN = [:construct, :publiques]
 
 const LC  = [:rural, :urbanunsk, :urbanskil]  # Rural, Urban unskilled, Urban skilled
 
+const WA0 = Dict{Symbol,Float64}(:rural => 0.11, :urbanunsk => 0.15678, :urbanskil => 1.8657)
+
+const SCALARS = Dict{Symbol,Float64}(
+    :er     => 0.21,     # Real exchange rate: CFAF per US dollar
+    :gr0    => 179.0,    # Government revenue (billion CFAF) -- start value only
+    :gdtot0 => 135.03,   # Total government consumption (billion CFAF)
+    :cdtot0 => 947.98,   # Total private consumption (billion CFAF)
+    :fsav0  => 36.841,   # Foreign savings / current-account deficit (billion USD)
+    :mps0   => 0.09305,  # Household saving rate (was a bare literal in `closuremp`)
+    :td0    => 0.0,      # Household direct-tax rate (Cameroon 1979-80 has no direct tax)
+)
+
+"Row names of the `miscellaneous` sheet, in the legacy workbook's fixed row order."
+const MISC_ROWS = [:m0, :e0, :xd0, :k, :depr, :rhoc, :rhot, :eta, :pd0, :tm0,
+                   :itax, :cles, :gles, :kio, :dstr, :dst, :id]
+
+"Names accepted in the `value` column of a generic workbook's `scalars` sheet, on top of
+one `wa0_<labour code>` per labour category. `tariff0` is the only one with no entry in
+`SCALARS`: omitted, `calibrate` derives it from the data (`Σ_IT m0·tm0/(1+tm0)`)."
+const SCALAR_NAMES = (:er, :gr0, :gdtot0, :cdtot0, :fsav0, :mps0, :td0, :tariff0)
+
 # =============================================================================
 # RAW DATA (returned by `load_data`)
 # =============================================================================
@@ -81,31 +107,61 @@ const LC  = [:rural, :urbanunsk, :urbanskil]  # Rural, Urban unskilled, Urban sk
 """
     RawData
 
-The five `camdata.xlsx` sheets, read exactly as the original script did (same
-hardcoded cell ranges and row order -- see `load_data`), plus the sector/labour sets.
-No calibration algebra has run yet; this is pass-through data.
+One base-year dataset, straight off the workbook: the sector set, the traded/non-traded
+partition, the labour categories, the five data matrices, the base wage per labour
+category and the economy-wide scalars. No calibration algebra has run yet; this is
+pass-through data, and it -- not any module constant -- is the source of truth for every
+set the rest of the model indexes over.
 """
 struct RawData
     SEC::Vector{Symbol}
     IT::Vector{Symbol}
     ITN::Vector{Symbol}
     LC::Vector{Symbol}
-    io::Dict{Tuple{Symbol,Symbol},Float64}     # iotable sheet
-    imat::Dict{Tuple{Symbol,Symbol},Float64}   # imat sheet
-    wdist::Dict{Tuple{Symbol,Symbol},Float64}  # wagedist sheet
-    xle::Dict{Tuple{Symbol,Symbol},Float64}    # employment sheet
-    zz::Dict{Tuple{Symbol,Symbol},Float64}     # miscellaneous sheet (17 rows x 11 sectors)
+    io::Dict{Tuple{Symbol,Symbol},Float64}     # iotable sheet, keyed (supplier, user)
+    imat::Dict{Tuple{Symbol,Symbol},Float64}   # imat sheet, keyed (origin, destination)
+    wdist::Dict{Tuple{Symbol,Symbol},Float64}  # wagedist sheet, keyed (sector, labour)
+    xle::Dict{Tuple{Symbol,Symbol},Float64}    # employment sheet, keyed (sector, labour)
+    zz::Dict{Tuple{Symbol,Symbol},Float64}     # miscellaneous sheet, keyed (MISC_ROWS name, sector)
+    wa0::Dict{Symbol,Float64}                  # base wage by labour category
+    scalars::Dict{Symbol,Float64}              # economy-wide scalars (SCALAR_NAMES)
 end
 
 """
     load_data(path::AbstractString) -> RawData
 
-Reads `path` (a `camdata.xlsx`-layout workbook: sheets `iotable`, `imat`, `wagedist`,
-`employment`, `miscellaneous`) into a `RawData`. Cell ranges and the `miscellaneous`
-row order are hardcoded, exactly as in the original script -- there is still no
-header-based lookup or shape validation.
+Reads a base-year workbook into a `RawData`, in either of two layouts, chosen by whether
+the workbook has a `sectors` sheet:
+
+**Generic (has a `sectors` sheet)** — any number of sectors and labour categories, in any
+order, all read by *header lookup* rather than by cell position:
+
+| Sheet | Shape | Contents |
+|---|---|---|
+| `sectors` | header row + one row per sector | `code`, `label`, `traded` (TRUE/FALSE) — defines `SEC`, and `IT`/`ITN` from `traded` |
+| `labour` | header row + one row per labour category | `code`, `label` — defines `LC` |
+| `iotable` | labelled N×N | `io[i,j]`, rows = supplying sector, columns = using sector |
+| `imat` | labelled N×N | `imat[i,j]`, rows = origin sector, columns = destination sector |
+| `employment` | labelled N×L | `xle[i,l]` |
+| `wagedist` | labelled N×L | `wdist[i,l]` |
+| `miscellaneous` | labelled 17×N | rows named `m0 e0 xd0 k depr rhoc rhot eta pd0 tm0 itax cles gles kio dstr dst id`, columns = sector codes |
+| `scalars` | header row + `name`,`value` rows | `er gr0 gdtot0 cdtot0 fsav0 mps0 td0 tariff0` and `wa0_<labour code>`; any omitted name falls back to the Cameroon literal in `SCALARS`/`WA0` (`wa0_*` to 1.0 for a labour code Cameroon does not have, `tariff0` to the value `calibrate` derives from the data) |
+
+On a labelled sheet, cell A1 is a free corner, row 1 holds the column headers and column A
+the row labels; order is irrelevant and a missing header, duplicate header or blank /
+non-numeric data cell is an error naming the sheet and the offending key.
+
+**Legacy (no `sectors` sheet)** — the original Cameroon `camdata.xlsx`: sheets `iotable`,
+`imat`, `wagedist`, `employment`, `miscellaneous` read at the original hardcoded cell
+ranges and row order, with `SEC`/`IT`/`ITN`/`LC`/`WA0`/`SCALARS` supplied as the module's
+Cameroon defaults. Unchanged, byte for byte, from the pre-`n-sector` loader.
 """
 function load_data(path::AbstractString)
+    xf = XLSX.readxlsx(path)
+    return "sectors" in XLSX.sheetnames(xf) ? _load_generic(xf) : _load_legacy(path)
+end
+
+function _load_legacy(path::AbstractString)
     dataio = XLSX.readdata(path, "iotable", "B3:L13")
     io = Dict{Tuple{Symbol,Symbol},Float64}()
     for i in 1:length(SEC), j in 1:length(SEC)
@@ -131,14 +187,182 @@ function load_data(path::AbstractString)
     end
 
     datazz = XLSX.readdata(path, "miscellaneous", "B3:L19")
-    rowz = [:m0, :e0, :xd0, :k, :depr, :rhoc, :rhot, :eta, :pd0, :tm0,
-            :itax, :cles, :gles, :kio, :dstr, :dst, :id]
     zz = Dict{Tuple{Symbol,Symbol},Float64}()
-    for i in 1:length(rowz), j in 1:length(SEC)
-        zz[rowz[i], SEC[j]] = datazz[i, j]
+    for i in 1:length(MISC_ROWS), j in 1:length(SEC)
+        zz[MISC_ROWS[i], SEC[j]] = datazz[i, j]
     end
 
-    return RawData(SEC, IT, ITN, LC, io, imat, wdist, xle, zz)
+    return RawData(SEC, IT, ITN, LC, io, imat, wdist, xle, zz, copy(WA0), copy(SCALARS))
+end
+
+function _load_generic(xf)
+    SECg, ITg, ITNg = _read_sectors(xf)
+    LCg = _read_labour(xf)
+    io    = _labelled(xf, "iotable",       SECg,      SECg)
+    imat  = _labelled(xf, "imat",          SECg,      SECg)
+    wdist = _labelled(xf, "wagedist",      SECg,      LCg)
+    xle   = _labelled(xf, "employment",    SECg,      LCg)
+    zz    = _labelled(xf, "miscellaneous", MISC_ROWS, SECg)
+    wa0, scalars = _read_scalars(xf, LCg)
+    return RawData(SECg, ITg, ITNg, LCg, io, imat, wdist, xle, zz, wa0, scalars)
+end
+
+# --- generic-workbook cell helpers -------------------------------------------------
+
+"A header/label cell as a `Symbol` (whitespace trimmed), or `nothing` if it is blank."
+function _key(v)
+    v === missing && return nothing
+    s = strip(string(v))
+    return isempty(s) ? nothing : Symbol(s)
+end
+
+"Row-1 headers of `t` as lowercase `Symbol => column index`."
+function _headers(t::AbstractMatrix)
+    d = Dict{Symbol,Int}()
+    for j in axes(t, 2)
+        k = _key(t[1, j])
+        k === nothing && continue
+        d[Symbol(lowercase(String(k)))] = j
+    end
+    return d
+end
+
+"A data cell as a `Float64`, erroring with the sheet and cell named if it is not one."
+function _num(v, sheet::AbstractString, what::AbstractString)
+    v isa Real && return Float64(v)
+    if v isa AbstractString
+        x = tryparse(Float64, strip(v))
+        x === nothing || return x
+    end
+    error("load_data: sheet `$sheet`, $what: expected a number, got $(repr(v))")
+end
+
+"A `traded` cell as a `Bool`, accepting Excel booleans, 0/1 and TRUE/FALSE-style strings."
+function _bool(v, sheet::AbstractString, what::AbstractString)
+    v isa Bool && return v
+    v isa Real && return v != 0
+    if v isa AbstractString
+        s = lowercase(strip(v))
+        s in ("true", "t", "yes", "y", "1")  && return true
+        s in ("false", "f", "no", "n", "0")  && return false
+    end
+    error("load_data: sheet `$sheet`, $what: expected TRUE or FALSE, got $(repr(v))")
+end
+
+function _sheet(xf, sheet::AbstractString)
+    sheet in XLSX.sheetnames(xf) ||
+        error("load_data: workbook has no `$sheet` sheet (its sheets are " *
+              join(XLSX.sheetnames(xf), ", ") * ")")
+    return xf[sheet][:]
+end
+
+"""
+    _labelled(xf, sheet, rowkeys, colkeys) -> Dict{Tuple{Symbol,Symbol},Float64}
+
+Reads a labelled matrix sheet -- cell A1 a free corner, row 1 the column headers, column A
+the row labels -- BY HEADER LOOKUP, so the order of rows and columns in the file is
+irrelevant, and returns every `(rowkey, colkey)` cell of `rowkeys × colkeys`. Rows and
+columns beyond those keys are ignored; a missing or duplicated header, or a blank /
+non-numeric data cell, is an error naming the sheet and the offending key.
+"""
+function _labelled(xf, sheet::AbstractString, rowkeys::Vector{Symbol}, colkeys::Vector{Symbol})
+    t = _sheet(xf, sheet)
+    index(keys_, cells, what) = begin
+        at = Dict{Symbol,Int}()
+        for (n, v) in cells
+            k = _key(v)
+            k === nothing && continue
+            haskey(at, k) && error("load_data: sheet `$sheet` has two $what labelled `$k`")
+            at[k] = n
+        end
+        for k in keys_
+            haskey(at, k) ||
+                error("load_data: sheet `$sheet` has no $(what[1:end-1]) labelled `$k`" *
+                      " (it has " * join(sort!(string.(collect(keys(at)))), ", ") * ")")
+        end
+        at
+    end
+    colat = index(colkeys, ((j, t[1, j]) for j in 2:size(t, 2)), "columns")
+    rowat = index(rowkeys, ((i, t[i, 1]) for i in 2:size(t, 1)), "rows")
+
+    d = Dict{Tuple{Symbol,Symbol},Float64}()
+    for r in rowkeys, c in colkeys
+        d[r, c] = _num(t[rowat[r], colat[c]], sheet, "row `$r` × column `$c`")
+    end
+    return d
+end
+
+"Reads the `sectors` sheet into (SEC, IT, ITN); `IT`/`ITN` come from the `traded` column."
+function _read_sectors(xf)
+    t = _sheet(xf, "sectors")
+    h = _headers(t)
+    for k in (:code, :traded)
+        haskey(h, k) || error("load_data: sheet `sectors` needs a `$k` column")
+    end
+    SECg, ITg, ITNg = Symbol[], Symbol[], Symbol[]
+    for i in 2:size(t, 1)
+        code = _key(t[i, h[:code]])
+        code === nothing && continue
+        code in SECg && error("load_data: sheet `sectors` lists sector `$code` twice")
+        push!(SECg, code)
+        traded = _bool(t[i, h[:traded]], "sectors", "row $i (`$code`), column `traded`")
+        push!(traded ? ITg : ITNg, code)
+    end
+    isempty(SECg) && error("load_data: sheet `sectors` lists no sectors")
+    isempty(ITg)  && error("load_data: sheet `sectors` marks no sector as traded")
+    return SECg, ITg, ITNg
+end
+
+"Reads the `labour` sheet into LC."
+function _read_labour(xf)
+    t = _sheet(xf, "labour")
+    h = _headers(t)
+    haskey(h, :code) || error("load_data: sheet `labour` needs a `code` column")
+    LCg = Symbol[]
+    for i in 2:size(t, 1)
+        code = _key(t[i, h[:code]])
+        code === nothing && continue
+        code in LCg && error("load_data: sheet `labour` lists labour category `$code` twice")
+        push!(LCg, code)
+    end
+    isempty(LCg) && error("load_data: sheet `labour` lists no labour categories")
+    return LCg
+end
+
+"""
+Reads the optional `scalars` sheet (`name`/`value` columns) into `(wa0, scalars)`. Every
+name it omits falls back to the Cameroon literal: `SCALARS[name]` for an economy-wide
+scalar, `WA0[l]` (or 1.0, for a labour code Cameroon does not have) for `wa0_<l>`.
+`tariff0` has no fallback here -- left out of `scalars`, `calibrate` derives it.
+"""
+function _read_scalars(xf, LCg::Vector{Symbol})
+    scalars = copy(SCALARS)
+    wa0 = Dict{Symbol,Float64}(l => get(WA0, l, 1.0) for l in LCg)
+    "scalars" in XLSX.sheetnames(xf) || return wa0, scalars
+
+    t = xf["scalars"][:]
+    h = _headers(t)
+    for k in (:name, :value)
+        haskey(h, k) || error("load_data: sheet `scalars` needs a `$k` column")
+    end
+    for i in 2:size(t, 1)
+        name = _key(t[i, h[:name]])
+        name === nothing && continue
+        v = _num(t[i, h[:value]], "scalars", "row $i (`$name`), column `value`")
+        s = String(name)
+        if startswith(s, "wa0_")
+            l = Symbol(s[5:end])
+            l in LCg || error("load_data: sheet `scalars` sets `$name`, but `$l` is not a " *
+                              "labour category in the `labour` sheet")
+            wa0[l] = v
+        else
+            name in SCALAR_NAMES ||
+                error("load_data: sheet `scalars` has unknown name `$name` (expected one of " *
+                      join(SCALAR_NAMES, ", ") * ", or wa0_<labour code>)")
+            scalars[name] = v
+        end
+    end
+    return wa0, scalars
 end
 
 # =============================================================================
@@ -164,8 +388,10 @@ mutable struct Params
     gr0::Float64        # base government revenue (start value only)
     gdtot0::Float64      # government real spending, closure-fixed
     cdtot0::Float64      # total private consumption at base (calibration only)
-    fsav0::Float64       # foreign savings, closure-fixed
+    fsav0::Float64       # foreign savings, closure-fixed (may be negative: trade surplus)
     mps0::Float64        # household saving rate, closure-fixed (was the literal 0.09305)
+    td0::Float64         # household direct-tax rate, closure-fixed (0 => no direct tax)
+    tariff0::Float64     # base tariff revenue (start value only), Σ_IT m0·tm0/(1+tm0)
     y0::Float64          # base private GDP (start value only)
 
     # per-sector (Symbol => Float64) -----------------------------------------------
@@ -230,14 +456,19 @@ function calibrate(raw::RawData)
     SEC, IT, ITN, LC = raw.SEC, raw.IT, raw.ITN, raw.LC
     io, imat, wdist, xle, zz = raw.io, raw.imat, raw.wdist, raw.xle, raw.zz
 
-    # Base-year scalars that were set directly in code (not read from the workbook).
-    wa0 = Dict{Symbol,Float64}(:rural => 0.11, :urbanunsk => 0.15678, :urbanskil => 1.8657)
-    er     = 0.21     # Real exchange rate: CFAF per US dollar
-    gr0    = 179.0    # Government revenue (billion CFAF)
-    gdtot0 = 135.03   # Total government consumption (billion CFAF)
-    cdtot0 = 947.98   # Total private consumption (billion CFAF)
-    fsav0  = 36.841   # Foreign savings / current-account deficit (billion USD)
-    mps0   = 0.09305  # Household saving rate (was a bare literal in `closuremp`)
+    # Base-year economy-wide scalars: from the workbook (a generic workbook's `scalars`
+    # sheet, or the Cameroon defaults the legacy loader stamps on), never from a literal
+    # here. `SCALARS[name]` is the fallback for anything a hand-built `RawData` omits.
+    sc = raw.scalars
+    scalar(name::Symbol) = get(sc, name, SCALARS[name])
+    wa0    = Dict{Symbol,Float64}(l => raw.wa0[l] for l in LC)
+    er     = scalar(:er)      # Real exchange rate (currency per unit foreign currency)
+    gr0    = scalar(:gr0)     # Government revenue (start value only)
+    gdtot0 = scalar(:gdtot0)  # Total government consumption
+    cdtot0 = scalar(:cdtot0)  # Total private consumption
+    fsav0  = scalar(:fsav0)   # Foreign savings (negative = base-year trade surplus)
+    mps0   = scalar(:mps0)    # Household saving rate
+    td0    = scalar(:td0)     # Household direct-tax rate
 
     depr  = Dict{Symbol,Float64}(i => zz[:depr, i]      for i in SEC)
     rhoc  = Dict{Symbol,Float64}(i => 1/zz[:rhoc, i] - 1 for i in SEC)  # Armington exponent
@@ -260,6 +491,27 @@ function calibrate(raw::RawData)
     xd0 = Dict{Symbol,Float64}(i => zz[:xd0, i] for i in SEC)
     k0  = Dict{Symbol,Float64}(i => zz[:k, i]   for i in SEC)
     pd0 = Dict{Symbol,Float64}(i => zz[:pd0, i] for i in SEC)
+
+    # Every traded sector needs strictly positive base-year imports AND exports, or the
+    # calibration algebra below silently produces NaN/Inf and the solve returns
+    # INVALID_MODEL: m0[i] == 0 forces gamma[i] = 0 (line ~"Sectors with zero imports"),
+    # which makes `ac[i]` NaN and `esupply`'s (1-gamma)/gamma divide by zero, while
+    # e0[i] == 0 gives gamma[i] = 1, at[i] = Inf and an `edemand` that divides by e0.
+    # Fail here instead, naming the sector, so the data builder can fix the file.
+    for i in IT
+        m0[i] > 0 && e0[i] > 0 && continue
+        error("calibrate: sector `$i` is marked traded but has m0 = $(m0[i]), e0 = $(e0[i]); " *
+              "every traded sector needs m0 > 0 AND e0 > 0. Fix the data: aggregate the " *
+              "sector into a neighbour, mark it non-traded (`traded = FALSE` in the " *
+              "`sectors` sheet, with m0 = e0 = 0), or give it a token trade flow and " *
+              "rebalance its commodity row.")
+    end
+
+    # Base tariff revenue -- a JuMP start value only (`tariff` is determined by
+    # `tariffdef`), so a workbook may just state it; otherwise derive it from the data.
+    # At base prices this is Σ_IT tm0·m0·pwm0·er with pwm0·er = pd0/(1+tm0).
+    tariff0 = haskey(sc, :tariff0) ? sc[:tariff0] :
+              sum(m0[i]*tm0[i]/(1 + tm0[i]) for i in IT)
 
     # At base year all domestic, import, and export prices are equal (normalisation).
     pm0 = copy(pd0)
@@ -318,10 +570,11 @@ function calibrate(raw::RawData)
     # Production function TFP parameter (ad): calibrated from base output quantities.
     qd = Dict{Symbol,Float64}()
     for i in SEC
-        qd[i] = (xllb[i, :rural]^alphl[:rural, i]) *
-                (xllb[i, :urbanunsk]^alphl[:urbanunsk, i]) *
-                (xllb[i, :urbanskil]^alphl[:urbanskil, i]) *
-                (k0[i]^(1 - sum(alphl[l, i] for l in LC)))
+        q = 1.0
+        for l in LC          # was three hardcoded Cameroon labour categories, same product
+            q *= xllb[i, l]^alphl[l, i]
+        end
+        qd[i] = q * (k0[i]^(1 - sum(alphl[l, i] for l in LC)))
     end
     ad = Dict{Symbol,Float64}(i => xd0[i] / qd[i] for i in SEC)
 
@@ -339,7 +592,7 @@ function calibrate(raw::RawData)
         for i in IT)
 
     return Params(SEC, IT, ITN, LC,
-                  er, gr0, gdtot0, cdtot0, fsav0, mps0, y0,
+                  er, gr0, gdtot0, cdtot0, fsav0, mps0, td0, tariff0, y0,
                   depr, rhoc, rhot, eta, tm0, te, itax, cles, gles, kio, dstr,
                   m0, e0, xd0, k0, pd0, pm0, pe0, pwm0, pwe0, pva0, xxd0, dst0, id0, cd0, int0, x0,
                   delta, ac, gamma, at, ad,
@@ -466,6 +719,7 @@ function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::
     delta, ac, gamma, at, ad = P.delta, P.ac, P.gamma, P.at, P.ad
     wa0, ls0                = P.wa0, P.ls0
     er, gr0, gdtot0, fsav0, mps0, y0 = P.er, P.gr0, P.gdtot0, P.fsav0, P.mps0, P.y0
+    td0, tariff0            = P.td0, P.tariff0
 
     cgecam = Model(Ipopt.Optimizer)
     silent && set_silent(cgecam)
@@ -505,7 +759,18 @@ function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::
     sv2(field::Symbol, i, l, default) = start === nothing ? default : getfield(start, field)[i, l]
 
     # -------------------------------------------------------------------------
-    # DECISION VARIABLES  (all strictly positive via lower bound 1e-6)
+    # DECISION VARIABLES  (strictly positive via lower bound 1e-6, except where noted)
+    #
+    # `hhsav`, `govsav` and `fsav` are declared FREE. All three are accounting residuals
+    # that a perfectly ordinary base year can show as negative -- a government running a
+    # deficit, an economy running a trade surplus, a household dissaving -- and a `>= 1e-6`
+    # bound on them made every such dataset infeasible rather than merely unusual (the
+    # identities analysis' §9 pitfalls 1a-1c). `td` is free for the same reason plus one
+    # more: `closuretd` pins it to `td0`, which is 0 whenever there is no direct tax, and
+    # a bound of 1e-6 against an equation demanding exactly 0 is the bound-vs-equation
+    # conflict the "STRUCTURALLY ZERO" block below exists to avoid. Ipopt's
+    # `bound_relax_factor` (set above) is unaffected: it relaxes bounds that exist, and
+    # these four now have none.
     # -------------------------------------------------------------------------
     @variables cgecam begin
         # Prices
@@ -541,16 +806,17 @@ function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::
         dst[i in SEC]  >= 1e-6, (start = sv1(:dst, i, dst0[i]))  # Inventory investment
         y              >= 1e-6, (start = sv0(:y, y0))             # Private GDP (value added minus depreciation)
         gr             >= 1e-6, (start = sv0(:gr, gr0))           # Government revenue
-        tariff         >= 1e-6, (start = sv0(:tariff, 76.548))    # Tariff revenue
+        tariff         >= 1e-6, (start = sv0(:tariff, tariff0))    # Tariff revenue
         indtax         >= 1e-6, (start = sv0(:indtax, nothing))    # Indirect tax revenue
         duty           >= 1e-6, (start = sv0(:duty, nothing))      # Export duty revenue
         gdtot          >= 1e-6, (start = sv0(:gdtot, nothing))     # Total government consumption volume
         mps            >= 1e-6, (start = sv0(:mps, nothing))       # Marginal propensity to save (households)
-        hhsav          >= 1e-6, (start = sv0(:hhsav, nothing))     # Household savings
-        govsav         >= 1e-6, (start = sv0(:govsav, nothing))    # Government savings (budget surplus/deficit)
+        td,             (start = td0)                              # Household direct-tax rate (free; see above)
+        hhsav,          (start = sv0(:hhsav, nothing))             # Household savings (free)
+        govsav,         (start = sv0(:govsav, nothing))            # Government savings (budget surplus/deficit; free)
         deprecia       >= 1e-6, (start = sv0(:deprecia, nothing))  # Economy-wide depreciation expenditure
         savings        >= 1e-6, (start = sv0(:savings, nothing))   # Total savings (= total investment)
-        fsav           >= 1e-6, (start = sv0(:fsav, fsav0))       # Foreign savings (current-account deficit)
+        fsav,           (start = sv0(:fsav, fsav0))                # Foreign savings (current-account deficit; free)
         dk[i in SEC]   >= 1e-6, (start = sv1(:dk, i, nothing))     # Investment by sector of destination
 
         # Welfare
@@ -736,20 +1002,23 @@ function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::
         dsteq[i in nonzero_dst],  dst[i] == dstr[i]*xd[i]
 
         # Private consumption: linear Engel curves, share cles[i] of disposable
-        # income. Restricted to sectors with cles[i] != 0 -- for cles[i] == 0 this
-        # equation would force cd[i] == 0 for any p/mps/y, so those cells are fixed
-        # directly above instead (mirrors the `cles[i] > 0.0` filter `obj` already
-        # uses for the same reason).
-        cdeq[i in nonzero_cd],    p[i]*cd[i] == cles[i]*(1 - mps)*y
+        # income -- income NET of the direct tax, `(1 - td)*y`. Restricted to sectors
+        # with cles[i] != 0 -- for cles[i] == 0 this equation would force cd[i] == 0
+        # for any p/mps/td/y, so those cells are fixed directly above instead (mirrors
+        # the `cles[i] > 0.0` filter `obj` already uses for the same reason).
+        cdeq[i in nonzero_cd],    p[i]*cd[i] == cles[i]*(1 - mps)*(1 - td)*y
 
         # Private GDP: aggregate value added minus economy-wide depreciation
         gdp,                      y == sum(pva[i]*xd[i] for i in SEC) - deprecia
 
-        # Household savings: fixed marginal propensity to save applied to income
-        hhsaveq,                  hhsav == mps*y
+        # Household savings: fixed marginal propensity to save applied to DISPOSABLE
+        # income (income net of the direct tax). Free to be negative (dissaving).
+        hhsaveq,                  hhsav == mps*(1 - td)*y
 
-        # Government revenue: sum of all tax instruments
-        greq,                     gr == tariff + duty + indtax
+        # Government revenue: sum of all tax instruments, including the direct tax on
+        # household income (`td*y`) -- the counterpart of the `(1 - td)` the household
+        # keeps in `cdeq`/`hhsaveq`, so the two sides of the transfer always net out.
+        greq,                     gr == tariff + duty + indtax + td*y
 
         # Government budget: revenue finances consumption plus budget surplus/deficit
         gruse,                    gr == sum(p[i]*gd[i] for i in SEC) + govsav
@@ -805,6 +1074,7 @@ function _solve_once(P::Params; silent::Bool=true, tol::Float64=1e-8, max_iter::
         closuret[it in IT],   tm[it]  == tm0[it]    # Tariffs fixed (policy instrument)
         closuref,             fsav    == fsav0       # Foreign savings exogenous
         closuremp,             mps     == mps0        # Household saving rate fixed
+        closuretd,            td      == td0         # Household direct-tax rate fixed
         closureg,             gdtot   == gdtot0      # Government spending volume fixed
         # Non-traded: no imports/no exports -- m[itn]/e[itn] are fixed directly above
         # instead of via an equation here (see the "STRUCTURALLY ZERO" block); keeping

@@ -11,6 +11,12 @@ sets, calibration, the model function, and two simulation runs — lives in the 
 See `README.md` for the full equation-by-equation description of the economics and for the current
 function-level API.
 
+**`n-sector` branch:** the model is no longer Cameroon-shaped. Sets and economy-wide scalars come
+from the data (see Architecture stages 1–2 and DATA.md §5), a household direct tax `td0` was added,
+and `hhsav`/`govsav`/`fsav`/`td` are free variables so a government deficit or a trade surplus is
+representable. With `td0 = 0` the Cameroon results are unchanged — `test/runtests.jl` still checks
+them bit-for-bit against `test/reference.json`.
+
 **`eps-integration` branch (do not merge into `main`'s history without review):** `cge.jl` was
 refactored from a top-to-bottom script with module-level mutable globals into a module
 (`CGECameroon`) with **no include-time solves and no module-level mutable parameter state**, so it
@@ -54,23 +60,31 @@ build process.
 pre-refactor script ran top-to-bottom (the order is preserved because later stages depend on earlier
 ones — don't reorder without checking what each later block reads):
 
-1. **Sets** (module-level `const`s at the top): `SEC` (11 sectors), `IT`/`ITN` (traded / non-traded
-   split), `LC` (3 labour categories, was `lc`). These are structural (Cameroon-only, hardcoded), not
-   scenario parameters, so they stay as plain constants — every function reads them off `RawData`/
-   `Params`, not off these globals directly.
+1. **Sets** — **data, not constants** (`n-sector`): the sector list, the traded/non-traded partition
+   and the labour categories are read off the workbook into `RawData`, carried through `Params`, and
+   used as the index sets of every `@variable`/`@NLconstraint`, so the model runs on any N sectors ×
+   L labour categories. The module `const`s at the top (`SEC`, `IT`, `ITN`, `LC`, `WA0`, `SCALARS`)
+   are now only the **defaults the legacy loader stamps on `data/camdata.xlsx`**, which has no sheets
+   for them; never index off them anywhere else.
 
-2. **`load_data(path) -> RawData`**: reads fixed cell ranges from the workbook at `path` (sheets
-   `iotable`, `imat`, `wagedist`, `employment`, `miscellaneous`) into `Dict`s keyed by
-   `(sector, sector)` or `(sector, labour)` tuples, returned as a `RawData` (plus the sets). Row order
-   in the `miscellaneous` sheet (`rowz`) must match the sheet's actual layout — there's still no
-   header-based lookup.
+2. **`load_data(path) -> RawData`**: two layouts, chosen by whether the workbook has a `sectors`
+   sheet. **Generic** (`_load_generic`): sheets `sectors`, `labour`, labelled `iotable`, `imat`,
+   `employment`, `wagedist`, `miscellaneous` and `scalars`, all read by **header lookup** so any
+   sector/labour order works — this is the format for a new country, fully specified in DATA.md §5
+   (`test/generic_workbook.jl` is a reference writer for it). **Legacy** (`_load_legacy`): the
+   original hardcoded `camdata.xlsx` cell ranges and `MISC_ROWS` row order, byte-for-byte unchanged.
+   Either way the result is `Dict`s keyed by `(sector, sector)` / `(sector, labour)` tuples plus the
+   sets, the per-labour base wages `wa0` and the economy-wide `scalars`.
 
 3. **`calibrate(raw::RawData) -> Params`**: closed-form algebra that backs out share/shift parameters
    (`delta`, `ac`, `gamma`, `at`, `ad`, `alphl`, ...) so the model reproduces the base-year SAM
    exactly, returned as a `Params` (a plain mutable struct holding every calibrated parameter and
-   closure value — including `mps0`, the household saving rate promoted out of a bare literal, and
-   `er`, the exchange rate). Several quantities are computed twice deliberately (e.g. `x0`/`ac` before
-   and after `ad` is derived) to maintain internal consistency, exactly as in the original.
+   closure value — including `mps0`, the household saving rate promoted out of a bare literal, `er`,
+   the exchange rate, `td0`, the household direct-tax rate, and `tariff0`, the base tariff revenue
+   start value, derived from the data instead of the old hardcoded `76.548`). It raises a named error
+   for any traded sector with `m0 <= 0` or `e0 <= 0`, which used to calibrate to NaN/Inf. Several
+   quantities are computed twice deliberately (e.g. `x0`/`ac` before and after `ad` is derived) to
+   maintain internal consistency, exactly as in the original.
 
 4. **`solve(p::Params; silent=true, tol=1e-8, max_iter=3000, start=nothing, steps=1, base=nothing) ->
    (sim, status, converged, iterations, elapsed)`**: `solve` itself is now a thin wrapper — when
@@ -120,5 +134,7 @@ include-time `baseline`/`sim1` runs on demand.
 
 All calibration data live in `data/camdata.xlsx`. See the README's "Data" table for sheet names,
 contents, and dimensions (11×11 IO/capital matrices, 11×3 wage/employment matrices, 17×11 scalar
-parameter sheet). Cell ranges are hardcoded in the loading code (stage 2 above); if the spreadsheet
-layout changes, the `XLSX.readdata` ranges and `rowz` ordering in `cge.jl` must be updated to match.
+parameter sheet). Its cell ranges are hardcoded in `_load_legacy` (stage 2 above); if that
+spreadsheet's layout changes, the `XLSX.readdata` ranges and the `MISC_ROWS` ordering must be updated
+to match. **A new dataset should not use that layout** — write the generic workbook of DATA.md §5
+instead, which is read by header lookup and carries its own sets and scalars.

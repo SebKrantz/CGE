@@ -16,6 +16,17 @@
 #  3. A reduced robustness testset (see test/robustness_grid.jl for the full ~60-scenario
 #     grid) confirms `solve`'s `start` keyword fixes the exact cold-start
 #     `LOCALLY_INFEASIBLE` cases a prior exploration found (e.g. +5pp tariff on services).
+#  4. The GENERIC workbook path: the Cameroon `RawData` is written back out in the generic
+#     layout (`test/generic_workbook.jl`) with its sectors and labour categories in REVERSE
+#     order, re-read through `load_data`'s generic branch, and must reproduce the legacy
+#     loader's sets, matrices, calibration and solution -- proving the loader is
+#     order-independent (header lookup, not cell position) and that nothing downstream of
+#     `RawData` depends on the Cameroon constants.
+#  5. A small SYNTHETIC 3-sector / 2-labour dataset (`test/synthetic_data.jl`) with a
+#     base-year TRADE SURPLUS (`fsav0 < 0`), a GOVERNMENT DEFICIT (`govsav0 < 0`) and a
+#     positive household DIRECT TAX (`td0 = 5%`) calibrates, round-trips through the generic
+#     workbook, and solves back to its own base year -- the three things the pre-`n-sector`
+#     model could not represent at all.
 
 using Test
 using JuMP
@@ -79,6 +90,11 @@ function parse_json_numeric(s::AbstractString)
 end
 
 """
+`fixed_cell` lists the cells `_solve_once` pins at exactly 0 (or at their base value); a
+relative comparison of two solver-noise values there is meaningless, so both the
+reference-file check below (`skip_cell`, which adds two aggregates) and the
+solution-vs-solution check (`max_sim_diff`) exclude them.
+
 Cells that `_solve_once` (cge.jl) now fixes directly instead of leaving them
 lower-bound-clipped near 1e-6 (or, for pe/pwe/tm, indeterminate/runaway) the way the
 pre-refactor script did -- see cge.jl's "STRUCTURALLY ZERO / INDETERMINATE CELLS"
@@ -146,7 +162,7 @@ just over threshold, and this is stable across every `tol`/`bound_relax_factor` 
     that sum by ~1e-5, which `govsav` (and `gr`, via tariff/duty) absorbs -- order 1e-5
     absolute on govsav's ~44 scale.
 """
-function skip_cell(params::CGECameroon.Params, f::Symbol, idx)
+function fixed_cell(params::CGECameroon.Params, f::Symbol, idx)
     f === :duty && return true
     f === :gd && return params.gles[idx] == 0.0
     f === :cd && return params.cles[idx] == 0.0
@@ -154,11 +170,14 @@ function skip_cell(params::CGECameroon.Params, f::Symbol, idx)
     f === :id && return all(params.imat[idx, j] == 0.0 for j in params.SEC)
     (f === :e || f === :m || f === :pe || f === :pm || f === :pwe) && return idx in params.ITN
     f === :tm && return (idx in params.ITN) || params.tm0[idx] == 0.0
-    (f === :tariff || f === :govsav) && return true
     return false
 end
-skip_cell(params::CGECameroon.Params, f::Symbol, i, l) =
+fixed_cell(params::CGECameroon.Params, f::Symbol, i, l) =
     f === :labd && params.alphl[l, i] == 0.0
+
+skip_cell(params::CGECameroon.Params, f::Symbol, idx) =
+    fixed_cell(params, f, idx) || f === :tariff || f === :govsav
+skip_cell(params::CGECameroon.Params, f::Symbol, i, l) = fixed_cell(params, f, i, l)
 
 "Maximum relative difference between a Simulation and a reference Dict (as read by
 `parse_json_numeric`), scanning every field (scalars and every element of every
@@ -189,6 +208,55 @@ function max_relative_diff(sim::CGECameroon.Simulation, ref::Dict{String,Any}, p
     return worst
 end
 _relerr(a, b) = abs(a - b) / max(abs(b), 1e-12)
+
+"Maximum relative difference between two `Simulation`s solved from the same economy (used
+to compare the generic-workbook path against the legacy one), skipping only the cells
+`fixed_cell` documents -- there both solves land on their own solver noise around 0."
+function max_sim_diff(a::CGECameroon.Simulation, b::CGECameroon.Simulation,
+                      params::CGECameroon.Params)
+    worst = 0.0
+    for f in fieldnames(CGECameroon.Simulation)
+        va, vb = getfield(a, f), getfield(b, f)
+        if va isa JuMP.Containers.DenseAxisArray
+            ax = axes(va)
+            if length(ax) == 1
+                for idx in ax[1]
+                    fixed_cell(params, f, idx) && continue
+                    worst = max(worst, _relerr(va[idx], vb[idx]))
+                end
+            else
+                for i1 in ax[1], i2 in ax[2]
+                    fixed_cell(params, f, i1, i2) && continue
+                    worst = max(worst, _relerr(va[i1, i2], vb[i1, i2]))
+                end
+            end
+        else
+            fixed_cell(params, f, nothing) && continue
+            worst = max(worst, _relerr(Float64(va), Float64(vb)))
+        end
+    end
+    return worst
+end
+
+"Maximum relative difference between two `Params`, over every scalar field and every value
+of every per-sector/per-labour `Dict` field (the set fields are compared separately)."
+function max_params_diff(a::CGECameroon.Params, b::CGECameroon.Params)
+    worst = 0.0
+    for f in fieldnames(CGECameroon.Params)
+        va, vb = getfield(a, f), getfield(b, f)
+        if va isa AbstractDict
+            for k in keys(va)
+                worst = max(worst, _relerr(va[k], vb[k]))
+            end
+        elseif va isa Float64
+            worst = max(worst, _relerr(va, vb))
+        end
+    end
+    return worst
+end
+
+include(joinpath(@__DIR__, "generic_workbook.jl"))  # write_generic_workbook: the test-side writer
+include(joinpath(@__DIR__, "synthetic_data.jl"))    # synthetic_rawdata: the 3-sector fixture
 
 const DATA_PATH = joinpath(@__DIR__, "..", "data", "camdata.xlsx")
 const REFERENCE = parse_json_numeric(read(joinpath(@__DIR__, "reference.json"), String))
@@ -270,6 +338,124 @@ const REFERENCE = parse_json_numeric(read(joinpath(@__DIR__, "reference.json"), 
         rows = run_grid(params, baseline_r, reduced; homotopy_steps = 4)
         for r in rows
             @test r.warm_converged
+        end
+    end
+
+    # The same Cameroon data, written back out in the GENERIC workbook layout (sheets
+    # `sectors`, `labour`, `iotable`, `imat`, `employment`, `wagedist`, `miscellaneous`,
+    # `scalars` -- see DATA.md §5 and `load_data`'s docstring) with its sectors AND labour
+    # categories in REVERSE order, then re-read through `load_data`'s generic branch. The
+    # loader works by header lookup, so the file's order must not matter: the sets must come
+    # back with the same membership, every matrix cell identical, and the calibration and the
+    # solved baseline must agree with the legacy path to 1e-8. This is the end-to-end check
+    # that nothing downstream of `RawData` reads the Cameroon `SEC`/`IT`/`ITN`/`LC` constants.
+    @testset "generic workbook reproduces the legacy Cameroon load" begin
+        dir = mktempdir()
+        path = write_generic_workbook(joinpath(dir, "camdata_generic.xlsx"), raw;
+                                      sector_order = reverse(raw.SEC),
+                                      labour_order = reverse(raw.LC))
+        graw = CGECameroon.load_data(path)
+
+        @test graw.SEC == reverse(raw.SEC)      # sets follow the FILE's order ...
+        @test graw.LC  == reverse(raw.LC)
+        @test Set(graw.IT)  == Set(raw.IT)      # ... with exactly the same membership
+        @test Set(graw.ITN) == Set(raw.ITN)
+        for f in (:io, :imat, :wdist, :xle, :zz)
+            d, g = getfield(raw, f), getfield(graw, f)
+            @test Set(keys(g)) == Set(keys(d))
+            @test maximum(abs(g[k] - d[k]) for k in keys(d)) == 0.0
+        end
+        @test graw.wa0 == raw.wa0
+        @test graw.scalars == raw.scalars
+        @test graw.scalars[:td0] == 0.0         # Cameroon 1979-80 has no direct tax
+
+        gparams = CGECameroon.calibrate(graw)
+        @test Set(gparams.SEC) == Set(params.SEC)
+        @test max_params_diff(gparams, params) < 1e-8
+
+        legacy_sim, _, legacy_converged, = CGECameroon.solve(params)
+        gsim, _, gconverged, = CGECameroon.solve(gparams)
+        @test legacy_converged
+        @test gconverged
+        @test max_sim_diff(gsim, legacy_sim, gparams) < 1e-8
+    end
+
+    # A dataset that is not Cameroon at all: 3 sectors (1 non-traded), 2 labour categories,
+    # and the three things the pre-`n-sector` model could not represent -- a base-year TRADE
+    # SURPLUS (fsav0 < 0), a GOVERNMENT DEFICIT (govsav0 < 0) and a household DIRECT TAX
+    # (td0 = 5%). It must calibrate, survive a generic-workbook round trip, and solve back to
+    # its own base year.
+    @testset "synthetic 3-sector dataset (trade surplus, government deficit, direct tax)" begin
+        sraw, expected = synthetic_rawdata()
+        @test length(sraw.SEC) == 3
+        @test length(sraw.LC) == 2
+        @test sraw.ITN == [:serv]
+
+        sparams = CGECameroon.calibrate(sraw)
+        @test isapprox(sparams.y0, expected.y0; rtol = 1e-12)
+        @test sparams.td0 == expected.td0 > 0
+        @test sparams.fsav0 == expected.fsav0 < 0    # trade surplus
+        # `tariff0` is deliberately absent from the workbook's `scalars`, so `calibrate`
+        # derives it from the data instead of using the old hardcoded Cameroon 76.548.
+        @test isapprox(sparams.tariff0, expected.tariff0; rtol = 1e-12)
+
+        sim, _, converged, = CGECameroon.solve(sparams)
+        @test converged
+        for i in sraw.SEC
+            @test isapprox(sim.xd[i], sparams.xd0[i]; rtol = 1e-6)
+            @test isapprox(sim.cd[i], sparams.cd0[i]; rtol = 1e-6)
+            @test isapprox(sim.k[i],  sparams.k0[i];  rtol = 1e-6)
+        end
+        for l in sraw.LC
+            @test isapprox(sim.ls[l], sparams.ls0[l]; rtol = 1e-6)
+        end
+        @test isapprox(sim.y,        expected.y0;        rtol = 1e-6)
+        @test isapprox(sim.deprecia, expected.deprecia0; rtol = 1e-6)
+        @test isapprox(sim.tariff,   expected.tariff0;   rtol = 1e-6)
+        @test isapprox(sim.indtax,   expected.indtax0;   rtol = 1e-6)
+        @test isapprox(sim.gr,       expected.gr0;       rtol = 1e-6)
+        @test isapprox(sim.hhsav,    expected.hhsav0;    rtol = 1e-6)
+        @test isapprox(sim.savings,  expected.savings0;  rtol = 1e-6)
+
+        # The two residuals that used to be bounded below at 1e-6, now free and negative.
+        @test sim.fsav < 0
+        @test isapprox(sim.fsav, expected.fsav0; rtol = 1e-6)
+        @test sim.govsav < 0
+        @test isapprox(sim.govsav, expected.govsav0; rtol = 1e-6)
+
+        # The direct tax is exactly the wedge between the two sides of the transfer: it is
+        # the part of government revenue no indirect instrument accounts for (greq), and the
+        # part of income the household neither spends nor saves (cdeq + hhsaveq).
+        @test isapprox(sim.gr - sim.tariff - sim.indtax - sim.duty,
+                       expected.td0 * expected.y0; rtol = 1e-6)
+        @test isapprox(sum(sim.p[i]*sim.cd[i] for i in sraw.SEC) + sim.hhsav,
+                       (1 - expected.td0) * sim.y; rtol = 1e-6)
+
+        @testset "round-trips through the generic workbook" begin
+            spath = write_generic_workbook(joinpath(mktempdir(), "synthetic.xlsx"), sraw)
+            sraw2 = CGECameroon.load_data(spath)
+            @test sraw2.SEC == sraw.SEC
+            @test sraw2.IT  == sraw.IT
+            @test sraw2.ITN == sraw.ITN
+            @test sraw2.LC  == sraw.LC
+            @test sraw2.wa0 == sraw.wa0
+            @test sraw2.scalars == sraw.scalars
+
+            sparams2 = CGECameroon.calibrate(sraw2)
+            @test max_params_diff(sparams2, sparams) < 1e-8
+            sim2, _, converged2, = CGECameroon.solve(sparams2)
+            @test converged2
+            @test max_sim_diff(sim2, sim, sparams2) < 1e-8
+        end
+
+        @testset "a traded sector with no base-year trade is a named error" begin
+            for (row, sector) in ((:m0, :agri), (:e0, :manuf))
+                bad, _ = synthetic_rawdata()
+                bad.zz[row, sector] = 0.0
+                err = try CGECameroon.calibrate(bad); nothing catch e; e end
+                @test err isa ErrorException
+                @test occursin(String(sector), err.msg)
+            end
         end
     end
 end

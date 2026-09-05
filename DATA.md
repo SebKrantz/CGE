@@ -2,21 +2,29 @@
 
 This document specifies what a base-year dataset for this model must contain, in what exact
 shape, so that someone can build a new country's input workbook **without reading `cge.jl`**.
-Section 3 documents the current workbook (`data/camdata.xlsx`) cell-by-cell, as actually read by
-`load_data`/`calibrate`. Section 5 proposes a generic long-format schema for future countries (not
-implemented). Section 6 only suggests where raw numbers might come from — not part of the data
-contract, since `load_data(path)` takes a path argument and knows nothing about the file's origin.
 
-All `cge.jl:N` references are to this repo's current `eps-integration` branch file (930 lines).
-All sheet contents quoted below were read directly from `data/camdata.xlsx` with `XLSX.jl`.
+`load_data` reads **two** layouts and picks between them automatically, on whether the workbook has
+a `sectors` sheet: the **legacy** Cameroon workbook (`data/camdata.xlsx`), documented cell-by-cell
+in section 3, and the **generic** workbook, documented in section 5 — the one a new country's data
+should be written in, since it carries its own sectors, traded/non-traded partition, labour
+categories and economy-wide scalars, for any sector and labour-category count. Section 6 only
+suggests where raw numbers might come from — not part of the data contract, since `load_data(path)`
+takes a path argument and knows nothing about the file's origin.
+
+All `cge.jl:N` references were written against the pre-`n-sector` file (930 lines) and are now
+roughly 200–300 lines low (the generic loader and the data-driven sets were inserted ahead of most
+of them); every function, variable and equation name they cite is unchanged. All sheet contents
+quoted below were read directly from `data/camdata.xlsx` with `XLSX.jl`.
 
 ---
 
 ## 1. What the model needs, conceptually
 
 The model is a **base-year social accounting picture for one country**: a single period, single
-representative household, single "rest of world" account, **11 production sectors** (2 of which
-are non-traded) and **3 labour categories**. Concretely, a new country's data must supply:
+representative household, single "rest of world" account, **N production sectors** (any number of
+which may be non-traded) and **L labour categories**. N, L and the traded/non-traded partition are
+read from the workbook (§5); the Cameroon dataset of §2–§3 is one instance of it, with N = 11
+(2 non-traded) and L = 3. Concretely, a new country's data must supply:
 
 - An **input-output table**: intermediate use of each sector's output by every other sector
   (sector × sector, "who buys from whom" as a share of the buying sector's gross output).
@@ -26,21 +34,25 @@ are non-traded) and **3 labour categories**. Concretely, a new country's data mu
   investment by sector of *destination* (via fixed shares) translated into investment by sector of
   *origin* via a **capital composition matrix** (`imat`) — i.e. "a unit of investment destined for
   sector X is made up of these shares of goods from sectors A, B, C…".
-- **Value added**, split into **labour income by 3 labour categories** and a **capital** residual,
+- **Value added**, split into **labour income by labour category** and a **capital** residual,
   plus a **depreciation rate** on capital.
 - **Taxes**: import tariffs, export duties, and indirect/production taxes — all as sector-specific
-  ad-valorem rates.
+  ad-valorem rates — plus one economy-wide **household direct-tax rate** `td0` (`0` if the dataset
+  has no direct tax, as Cameroon 1979–80 does not).
 - The **external account**: foreign savings (the current-account deficit, in foreign currency).
 - **Employment by sector × labour category** (levels) and a **wage-distribution matrix** (relative
   wages of each labour category within each sector).
 - A handful of **economy-wide scalars**: the exchange rate, total government spending, total
-  household consumption, the household saving rate, government revenue (a start value only).
+  household consumption, the household saving rate, the direct-tax rate, government revenue and
+  base tariff revenue (the last two are solver start values only). See §5's `scalars` sheet.
 
 **Units.** Almost everything is in **billion base-year CFAF** (flows and capital stocks alike).
 Employment is in **1000 persons**. Wages are in **million CFAF per 1000 workers**. The exchange
 rate and foreign savings are the only quantities in **USD** (billion), because the current-account
 identity is expressed at world prices (`caeq`, cge.jl:792). All base-year prices are normalised to
-**1** (confirmed: every `pd0` cell in the workbook is exactly `1.0`).
+**1** (confirmed: every `pd0` cell in the workbook is exactly `1.0`). None of this is enforced: the
+model is unit-agnostic, so a new dataset may state everything in its own currency with `er = 1`
+(that is what the synthetic fixture in `test/synthetic_data.jl` does).
 
 **Base year convention.** The model calibrates to exactly one year (here, Cameroon's 1979–80).
 There is no time dimension in the data or the equations — "base year" means the single
@@ -49,9 +61,16 @@ reproduces that cross-section exactly (`calibrate`, cge.jl:229–347; see §4).
 
 **Scope note.** This is a **single-country, single-household** model: one representative
 household (no income deciles, no rural/urban split), one government, and the rest of the world
-appears only through the trade/current-account equations — not as a modelled region. The set
-`SEC` fixes **11 sectors** and `LC` fixes **3 labour categories**; of the 11 sectors, **2 are
-non-traded** (`construct`, `publiques`) and have no import/export data at all (cge.jl:57–75).
+appears only through the trade/current-account equations — not as a modelled region. Sector count,
+sector names, the traded/non-traded partition and the labour categories are **data**, read off the
+workbook into `RawData` and carried through `Params` into every index set of the model
+(`_solve_once`); the module `const`s `SEC`/`IT`/`ITN`/`LC`/`WA0`/`SCALARS` survive only as the
+defaults the legacy loader stamps on `data/camdata.xlsx`, which has no sheets of its own for them.
+
+**Signs.** `fsav0` (foreign savings) is negative for a base-year **trade surplus**, and the solved
+`govsav` (government budget balance) and `hhsav` (household saving) may likewise come out negative —
+all three variables are declared free in `_solve_once`. A base year with a surplus, a government
+deficit or household dissaving is ordinary data, not an error.
 
 ---
 
@@ -72,9 +91,11 @@ non-traded** (`construct`, `publiques`) and have no import/export data at all (c
 | 11 | `publiques` | Public services | **non-traded** |
 
 Source: `SEC` cge.jl:57–69, `IT` (the 9 traded sectors) cge.jl:71–72, `ITN` (the 2 non-traded
-sectors) cge.jl:73. **Sector position and count are structural** — they are Julia `const`s, not
-data read from any sheet. The 11-way split and the traded/non-traded partition (positions 9 and 11
-are non-traded) cannot change without editing `cge.jl` itself.
+sectors) cge.jl:73. These `const`s are **the legacy workbook's defaults, not a structural limit**:
+`data/camdata.xlsx` carries no `sectors`/`labour` sheets, so `load_data` stamps them onto the
+`RawData` it builds from it. A generic workbook (§5) states its own sector list, traded flags and
+labour categories, in any order and any count, and every set-indexed variable and equation in the
+model follows that data.
 
 | Labour category (`LC`) | Meaning |
 |---|---|
@@ -82,14 +103,17 @@ are non-traded) cannot change without editing `cge.jl` itself.
 | `urbanunsk` | Urban unskilled labour |
 | `urbanskil` | Urban skilled labour |
 
-Source: cge.jl:75.
+Source: cge.jl:75. Their base wages `wa0` (million CFAF per 1000 workers: `rural 0.11`,
+`urbanunsk 0.15678`, `urbanskil 1.8657`) are the module `const` `WA0`, likewise a legacy-workbook
+default; a generic workbook states one `wa0_<code>` per labour category on its `scalars` sheet.
 
 ---
 
-## 3. The exact current workbook contract (`data/camdata.xlsx`)
+## 3. The legacy workbook contract (`data/camdata.xlsx`)
 
-Five sheets, read by `load_data(path)` (cge.jl:108–142) with **hardcoded cell ranges and no
-header-based lookup** — column/row headers in the workbook are free text for a human reader only;
+This is the **legacy** layout, taken whenever the workbook has **no `sectors` sheet**; a new
+country's dataset should use the generic layout of §5 instead. Five sheets, read by `_load_legacy`
+(cge.jl:164–196) with **hardcoded cell ranges and no header-based lookup** — column/row headers in the workbook are free text for a human reader only;
 the code never looks at them. Data is read positionally: **column order and row order must match
 the 11-sector / 3-labour ordering in §2 exactly.**
 
@@ -197,12 +221,14 @@ into calibration algebra — they are used only as JuMP solver start values (cge
 new country's data for these two rows only needs to be a reasonable base-year cross-check, not an
 input the calibration depends on.
 
-Several economy-wide scalars are **not** on any sheet — hardcoded in `calibrate` (cge.jl:234–240)
-and needed for a new country outside the workbook: base wages by labour category `wa0` (million
-CFAF/1000 workers: rural `0.11`, urban-unskilled `0.15678`, urban-skilled `1.8657`) and the scalars
-`er=0.21` (CFAF/USD), `gr0=179.0`, `gdtot0=135.03`, `cdtot0=947.98`, `fsav0=36.841` (billion USD),
-`mps0=0.09305`. `te` (export duty rate) is **not read from any sheet** — hardcoded to `0.0` for
-every sector (cge.jl:247): today's contract has no export-duty row.
+Several economy-wide scalars are **not** on any legacy sheet: the module `const`s `WA0` (base wages
+by labour category, million CFAF/1000 workers: rural `0.11`, urban-unskilled `0.15678`,
+urban-skilled `1.8657`) and `SCALARS` (`er=0.21` CFAF/USD, `gr0=179.0`, `gdtot0=135.03`,
+`cdtot0=947.98`, `fsav0=36.841` billion USD, `mps0=0.09305`, `td0=0.0`) supply them, and
+`_load_legacy` copies both onto the `RawData` — `calibrate` reads them from there, never from a
+literal. A generic workbook states them on its own `scalars` sheet (§5) and needs nothing from these
+constants. `te` (export duty rate) is **not read from any sheet** in either layout — hardcoded to
+`0.0` for every sector: today's contract has no export-duty row.
 
 ---
 
@@ -239,12 +265,13 @@ point. In order of computation:
 2. **Budget shares sum to 1.** `Σ_i cles[i] = 1` over sectors with `cles[i] > 0` (verified: the 8
    non-zero `cles` cells in §3.5 sum to exactly `1.00000`); `Σ_i gles[i] = 1` (only `publiques=1`
    here); `Σ_i kio[i] = 1` (verified: sums to exactly `1.00`).
-3. **Zero-import ⇒ zero CET share.** `gamma[i]` is forced to 0 wherever `m0[i]==0` (cge.jl:309–311).
-   In this dataset that rule is only ever triggered by the two **non-traded** sectors (`construct`,
-   `publiques`, both `m0=0`), which are outside `IT` anyway and never use `gamma`; **no traded
-   sector in this Cameroon data has `m0[i]==0`**, so the rule is defensive, not actually load-
-   bearing here — a future country whose data does zero out imports for a genuinely traded sector
-   would exercise it for real.
+3. **Every traded sector must actually trade.** `m0[i] > 0` **and** `e0[i] > 0` for every `i in IT`.
+   Otherwise the calibration algebra degenerates silently — `m0[i]==0` forces `gamma[i]=0`, which
+   makes `ac[i]` NaN and divides by zero in `esupply`; `e0[i]==0` gives `gamma[i]=1`, `at[i]=Inf`
+   and an `edemand` that divides by `e0` — so `calibrate` now **raises an error naming the sector**
+   instead of returning NaN/Inf and letting the solve fail with `INVALID_MODEL`. Fixes: aggregate
+   the sector into a neighbour, mark it `traded = FALSE` (with `m0 = e0 = 0`), or give it a token
+   trade flow and rebalance its commodity row.
 4. **Non-traded sectors must have zero trade data.** For `i in ITN` (`construct`, `publiques`),
    `m0[i]` and `e0[i]` must be exactly `0` in the sheet (verified) — the model additionally *forces*
    `m[i]=e[i]=0` at solve time regardless of what the sheet says (`fix(...)`, cge.jl:646–652), so a
@@ -256,7 +283,7 @@ point. In order of computation:
    (cge.jl:592–600, 628–653). This fixing logic — like the analogous zero handling for `gd`, `cd`,
    `dst`, `id` (cge.jl:628–635, from `gles[i]==0`, `cles[i]==0`, `dstr[i]==0`, an all-zero `imat`
    row) — is computed dynamically from whichever `Params` are passed in, **not** from a hardcoded
-   list of sector names, so it already generalises to any dataset of the same 11×3 shape. Only the
+   list of sector names, so it generalises to any N-sector × L-labour dataset. Only the
    two non-traded sectors' forced-zero trade cells and `duty≡0` (`te≡0` always) are structural
    regardless of the data.
 7. **Base-year replication check.** Solving `calibrate(load_data(path))` cold must reproduce
@@ -271,49 +298,158 @@ point. In order of computation:
 import Pkg; Pkg.activate(@__DIR__)
 include("cge.jl"); using .CGECameroon
 
-raw = load_data(path)            # will throw on a dimension mismatch, nothing else is checked
-params = calibrate(raw)          # closed-form algebra; NaN/Inf here usually means a zero divided
-                                  # by zero (e.g. m0==0 and xxd0==0 in the same traded sector)
+raw = load_data(path)            # generic layout: errors naming the sheet and the offending
+                                  # sector/label on a missing header or a non-numeric cell
+params = calibrate(raw)          # closed-form algebra; errors naming any traded sector with
+                                  # m0 <= 0 or e0 <= 0 (rule 3 above)
 baseline, status, converged, iters, elapsed = solve(params)
 converged || error("does not reproduce the base year: $status")
 # compare baseline.xd/.k/.ls/.y/.fsav against params.xd0/.k0/.ls0/.y0/.fsav0
 ```
 Or simply run `CGECameroon.example()` (cge.jl:914–928, reproduces baseline + the `sim1` shock and
 prints a summary), and the full regression suite: `julia --project=. test/runtests.jl`
-(`test/runtests.jl`, 3 testsets: base-year replication, a bit-for-bit regression against
-`test/reference.json`, and a warm-start robustness check) plus the optional ~60-scenario grid in
-`test/robustness_grid.jl`.
+(`test/runtests.jl`, 5 testsets: base-year replication, a bit-for-bit regression against
+`test/reference.json`, a warm-start robustness check, a generic-workbook round trip of the Cameroon
+data, and the synthetic 3-sector dataset of `test/synthetic_data.jl`) plus the optional
+~60-scenario grid in `test/robustness_grid.jl`.
 
 ---
 
-## 5. Proposed generic long-format schema (NOT YET IMPLEMENTED)
+## 5. The generic workbook format (implemented — use this for a new country)
 
-Today's loader is Cameroon-only: `SEC`/`IT`/`ITN`/`LC` are hardcoded constants and every cell range
-in `load_data` assumes exactly this 11-sector/3-labour/2-non-traded layout (cge.jl:57–142). Onboarding
-a genuinely different country under the *current* code means literally reusing these 11 symbols
-positionally (a new country's "sector 9" must still be its non-traded construction-like sector) or
-editing `cge.jl` itself. The following is a **proposal**, not built: a single generic long-format
-schema every future country's data would be transformed into, so one generic loader could serve all
-of them regardless of sector count or names.
+`load_data(path)` chooses its loader by **whether the workbook has a sheet named `sectors`**: if it
+does, the file is read as a *generic* workbook — any number of sectors, any traded/non-traded
+partition, any number of labour categories, in **any order** — and if it does not, as the legacy
+Cameroon workbook of §3. Nothing else distinguishes the two, and nothing about the model is
+Cameroon-specific once the file is loaded: `RawData` carries the sets, and `calibrate`/`_solve_once`
+index every parameter, variable and equation by them.
 
-| File | Grain | Columns | Maps onto today's workbook |
-|---|---|---|---|
-| `sectors.csv` | one row per sector | `code, label, traded, non_traded` | §2 table (`SEC`/`IT`/`ITN`, cge.jl:57–75) |
-| `io.csv` | one row per (from,to) pair with a non-zero flow | `from_sector, to_sector, value` | `iotable` sheet, §3.1 (`io[i,j]`) |
-| `final_demand.csv` | one row per (sector, component) | `sector, component, value` (`component` ∈ `consumption, government, investment_origin, investment_destination, inventory`) | `cd0`/`cles`, `gd`/`gles`, `id`/`imat`, `dst`/`dstr` in the `miscellaneous` and `imat` sheets, §3.2/§3.5 |
-| `factors.csv` | one row per (sector, labour_category) | `sector, labour_category, employment, wage_share` | `employment` (§3.3) + `wagedist` (§3.4) sheets |
-| `trade.csv` | one row per traded sector | `sector, imports, exports, world_import_price, tariff_rate, export_tax_rate` | `m0, e0, pwm0, tm0` (`te` today is a hardcoded scalar, not sheet data), §3.5 |
-| `scalars.csv` | one row per named scalar | `name, value` (`government_spending, foreign_savings, exchange_rate, saving_rate, capital_stock_by_sector, depreciation_rate_by_sector, elasticities…`) | the hardcoded scalars of cge.jl:234–240 plus the `k`, `depr`, `rhoc`, `rhot`, `eta`, `kio` rows of `miscellaneous` |
-| `dataset.toml` | one file | `country, year, currency, source` | not present today at all — see §6, `registry.toml`'s per-dataset metadata is the closest existing analogue |
+`test/generic_workbook.jl` (`write_generic_workbook`) is the reference *writer* for this format —
+the round-trip test writes `data/camdata.xlsx` out in it, with sectors and labour categories in
+reverse order, and requires the result to reproduce the legacy load's calibration and solution to
+1e-8.
 
-Every current workbook cell has a home in this schema (see the "Maps onto" column above); nothing
-in §3 is dropped, it is only re-shaped from fixed positional ranges into keyed long rows so a
-loader can validate shape/keys and support an arbitrary sector list and count. This schema is
-**aspirational** — implementing it means writing a new `load_data`-equivalent, generalising
-`SEC`/`IT`/`ITN`/`LC` into data read from `sectors.csv`/`factors.csv` rather than module `const`s,
-and parameterising every set-indexed `@variable`/`@NLconstraint` in `_solve_once` (cge.jl:510–816)
-by those data-driven sets instead of the hardcoded ones — real refactoring work, not yet started
-on this branch.
+### 5.1 Sheets
+
+Eight sheets, all **lower-case names, matched exactly**; sheet order in the file is irrelevant, and
+any additional sheet is ignored.
+
+| Sheet | Shape | Contents |
+|---|---|---|
+| `sectors` | header row + one row per sector | `code`, `label`, `traded` — defines the sector set, and the traded/non-traded partition from `traded` |
+| `labour` | header row + one row per labour category | `code`, `label` — defines the labour-category set |
+| `iotable` | labelled N×N | `io[i,j]`: **rows = supplying** sector, **columns = using** sector (§3.1) |
+| `imat` | labelled N×N | `imat[i,j]`: **rows = origin** sector, **columns = destination** sector (§3.2) |
+| `employment` | labelled N×L | `xle[i,l]`: rows = sector, columns = labour category (§3.3) |
+| `wagedist` | labelled N×L | `wdist[i,l]`: rows = sector, columns = labour category (§3.4) |
+| `miscellaneous` | labelled 17×N | rows = the 17 parameter names below, columns = sector codes (§3.5) |
+| `scalars` | header row + `name`,`value` rows | the economy-wide scalars (§5.4); **optional**, but a new country should always write it |
+
+### 5.2 Labelled matrix sheets (`iotable`, `imat`, `employment`, `wagedist`, `miscellaneous`)
+
+```
+     A          B          C          D
+1    <corner>   agri       manuf      serv        ← row 1: column headers
+2    agri       0.10       0.15       0.02        ← column A: row labels
+3    manuf      0.08       0.20       0.10
+4    serv       0.05       0.10       0.15
+```
+
+- **Cell A1 is a free corner** — anything (a title, or blank); the loader never reads it.
+- **Row 1** holds the column labels, **column A** the row labels. Both are looked up **by name**, so
+  row and column order are irrelevant and need not agree between sheets or with the `sectors` sheet.
+- Labels are **case-sensitive** and whitespace-trimmed, and must match the `code` values of the
+  `sectors`/`labour` sheets exactly (unlike the *header* names of §5.3/§5.4, which are matched
+  case-insensitively).
+- Rows and columns beyond the expected labels are **ignored** (so a total row/column is harmless);
+  a **missing** label, a **duplicate** label, or a **blank or non-numeric** data cell in the
+  expected block is an error naming the sheet and the offending key.
+- Every cell of the N×N / N×L / 17×N block must be present — write explicit `0`s, not blanks.
+
+The `miscellaneous` sheet's 17 row labels, exactly (order irrelevant, all required, one column per
+sector — see §3.5 for the meaning and units of each):
+
+`m0`, `e0`, `xd0`, `k`, `depr`, `rhoc`, `rhot`, `eta`, `pd0`, `tm0`, `itax`, `cles`, `gles`, `kio`,
+`dstr`, `dst`, `id`
+
+### 5.3 `sectors` and `labour`
+
+```
+sectors:                              labour:
+     A          B              C           A            B
+1    code       label          traded  1   code         label
+2    agri       Agriculture    TRUE    2   unskilled    Unskilled labour
+3    manuf      Manufacturing  TRUE    3   skilled      Skilled labour
+4    serv       Services       FALSE
+```
+
+- Row 1 holds the column **headers**, looked up by name and **case-insensitively**; column order is
+  irrelevant and extra columns are ignored.
+- `sectors` requires `code` and `traded`; `labour` requires `code`. `label` is optional and is read
+  by nobody — it is there for the human reading the file.
+- `code` becomes a Julia `Symbol` and is the key used everywhere else (matrix labels,
+  `miscellaneous` columns, `with_shocks` overrides), so keep it short, ASCII and space-free.
+  Duplicate codes are an error; a row with a blank `code` is skipped, so trailing blank rows are
+  harmless.
+- `traded` accepts an Excel boolean (`TRUE`/`FALSE`), a number (`0`/`1`, non-zero = traded), or a
+  string (`true/false`, `t/f`, `yes/no`, `y/n`, `1/0`, any case). At least one sector must be
+  traded; every traded sector must have `m0 > 0` and `e0 > 0` (§4 rule 3), and every non-traded one
+  must have `m0 = e0 = 0`.
+
+### 5.4 `scalars`
+
+```
+     A             B
+1    name          value
+2    er            1.0
+3    gr0           76.6
+4    gdtot0        100.0
+5    cdtot0        523.26
+6    fsav0         -40.0
+7    mps0          0.10
+8    td0           0.05
+9    wa0_unskilled 1.0
+10   wa0_skilled   1.0
+```
+
+Two columns, `name` and `value` (headers matched case-insensitively, order irrelevant). One row per
+scalar, in any order; a blank `name` skips the row. An **unrecognised** name is an error.
+
+| Name | Meaning | Omitted ⇒ |
+|---|---|---|
+| `er` | exchange rate, domestic currency per unit foreign currency (`1.0` if the whole dataset is in one currency) | `0.21` |
+| `gr0` | base government revenue — **solver start value only** | `179.0` |
+| `gdtot0` | total government consumption; closure-fixed (`closureg`) | `135.03` |
+| `cdtot0` | total private consumption; used by calibration (`cd0 = cles·cdtot0`) | `947.98` |
+| `fsav0` | foreign savings = current-account deficit, in **foreign** currency; closure-fixed (`closuref`). **Negative for a trade surplus** | `36.841` |
+| `mps0` | household saving rate on disposable income; closure-fixed (`closuremp`) | `0.09305` |
+| `td0` | household **direct-tax** rate; closure-fixed (`closuretd`). `0` = no direct tax | `0.0` |
+| `tariff0` | base tariff revenue — **solver start value only** | derived: `Σ_traded m0·tm0/(1+tm0)` |
+| `wa0_<labour code>` | base wage of that labour category, one row each (`wa0_skilled`, …) | the Cameroon `WA0` value for a code Cameroon has, else `1.0` |
+
+The "omitted" column is the fallback: the whole sheet may be left out, and any single name may be —
+the module's Cameroon `const`s (`SCALARS`/`WA0`) fill the gap. **A new country should write every
+name explicitly**; silently inheriting Cameroon's exchange rate or saving rate is a much worse
+failure than a missing-sheet error.
+
+`wa0` and `wdist` are only ever used as the product `wa0[l]·wdist[i,l]·xle[i,l]`, the base-year wage
+bill of cell `(i,l)`, so a dataset that knows wage bills rather than wages and employment can set
+`wa0 = 1`, `wdist = 1` and put the **wage bill** in `employment` — that is what
+`test/synthetic_data.jl` does.
+
+### 5.5 What the direct tax does, and which balances may be negative
+
+`td0` is the one genuinely new parameter relative to §3's Cameroon contract. It enters three
+equations: the household spends and saves out of **disposable** income `(1 − td)·y`
+(`cdeq`, `hhsaveq`), and government revenue gains `td·y` (`greq`), so the transfer nets out exactly;
+`closuretd` fixes `td = td0`. With `td0 = 0` every equation reduces to the pre-`n-sector` model —
+the Cameroon results are unchanged, which is what `test/reference.json` still checks bit-for-bit.
+
+`hhsav`, `govsav`, `fsav` and `td` are declared **free** in `_solve_once` (they used to carry the
+same `>= 1e-6` lower bound as every quantity variable). A base year with a **government deficit**
+(`govsav < 0`), a **trade surplus** (`fsav < 0`) or household **dissaving** (`hhsav < 0`) is
+therefore ordinary data now, rather than an infeasible model. The `savings = hhsav + govsav +
+deprecia + fsav·er` total is still bounded positive, as are all prices and quantities.
 
 ---
 

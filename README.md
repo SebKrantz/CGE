@@ -21,9 +21,16 @@ This model follows the **Davis-De Melo-Robinson** framework described in Dervis,
 | `ITN` | Non-traded sectors | 2 (construct, publiques) |
 | `lc` | Labour categories | rural, urbanunsk, urbanskil |
 
+The sets are **data, not constants**: sector codes, the traded/non-traded partition and the
+labour categories are read from the workbook into `RawData` and carried through `Params` into
+every `@variable`/`@NLconstraint` index set, so the model runs on any N sectors × L labour
+categories. The members above are Cameroon's, supplied as defaults for the legacy
+`data/camdata.xlsx` (which carries no sets of its own) — see DATA.md §5 for the generic
+workbook format that states them as data.
+
 ### Production
 
-- Cobb-Douglas production function with three heterogeneous labour types and fixed capital
+- Cobb-Douglas production function with heterogeneous labour types and fixed capital
 - Sector-specific total factor productivity (TFP) parameter `ad` calibrated to base year
 - Leontief intermediate input demands (fixed IO coefficients `io[i,j]`)
 - Depreciation reduces capital services available to each sector
@@ -40,12 +47,12 @@ Non-traded sectors (`construct`, `publiques`) have neither imports nor exports.
 
 ### Government
 
-- Revenue: tariffs + export duties + indirect production taxes
-- Expenditure: fixed-share consumption (`gles`) of fixed volume (`gdtot`) + budget surplus/deficit (`govsav`)
+- Revenue: tariffs + export duties + indirect production taxes + a direct tax on household income (`td·y`)
+- Expenditure: fixed-share consumption (`gles`) of fixed volume (`gdtot`) + budget surplus/deficit (`govsav`, free to be negative)
 
 ### Savings and Investment
 
-- Household savings: fixed marginal propensity to save (`mps = 0.09305`)
+- Household savings: fixed marginal propensity to save out of **disposable** income, `hhsav = mps·(1−td)·y` (Cameroon: `mps0 = 0.09305`, `td0 = 0`)
 - Total savings = household + government + depreciation + foreign savings
 - Investment allocated across sectors by fixed shares `kio`; capital goods sourced via `imat`
 
@@ -57,9 +64,14 @@ Non-traded sectors (`construct`, `publiques`) have neither imports nor exports.
 | World prices `pwm` | Fixed (small open economy) |
 | Labour supplies `ls` | Fixed (inelastic labour supply) |
 | Tariff rates `tm` | Fixed at base `tm0` (policy instrument) |
-| Foreign savings `fsav` | Fixed at base `fsav0` |
-| Household saving rate `mps` | Fixed at 0.09305 |
+| Foreign savings `fsav` | Fixed at base `fsav0` (negative = trade surplus) |
+| Household saving rate `mps` | Fixed at base `mps0` |
+| Household direct-tax rate `td` | Fixed at base `td0` (`0` = no direct tax) |
 | Government consumption volume `gdtot` | Fixed at base `gdtot0` |
+
+`hhsav`, `govsav`, `fsav` and `td` are declared **free** (no lower bound), so a base year with a
+government deficit, a trade surplus or household dissaving is representable; every price and
+quantity variable keeps its `>= 1e-6` bound.
 
 ---
 
@@ -74,6 +86,13 @@ All calibration data are in [`data/camdata.xlsx`](data/camdata.xlsx):
 | `wagedist` | Wage proportionality factors by sector and labour type | 11 × 3 |
 | `employment` | Base-year employment in 1000 persons | 11 × 3 |
 | `miscellaneous` | Scalar parameters: volumes, prices, elasticities, shares | 17 × 11 |
+
+`load_data` reads this **legacy** layout at fixed cell ranges. A workbook with a `sectors` sheet is
+instead read as a **generic** workbook — `sectors`, `labour`, labelled `iotable`, `imat`,
+`employment`, `wagedist`, `miscellaneous`, and a `scalars` sheet (`er`, `gr0`, `gdtot0`, `cdtot0`,
+`fsav0`, `mps0`, `td0`, `tariff0`, `wa0_<labour code>`) — with any sector count, any
+traded/non-traded partition, any labour categories, in any order, all by header lookup. **DATA.md
+§5 is the full specification**; `test/generic_workbook.jl` is a reference writer for it.
 
 ---
 
@@ -167,7 +186,7 @@ equation that forces each one.
 
 | Function | Signature | Purpose |
 |---|---|---|
-| `load_data` | `(path) -> RawData` | Reads the 5 `camdata.xlsx` sheets (same hardcoded ranges as before) |
+| `load_data` | `(path) -> RawData` | Reads a base-year workbook: the **generic** layout (8 sheets, header lookup, sets and scalars as data — DATA.md §5) when it has a `sectors` sheet, the **legacy** `camdata.xlsx` layout (5 sheets, hardcoded ranges, Cameroon sets as defaults) otherwise |
 | `calibrate` | `(raw::RawData) -> Params` | Closed-form calibration algebra (unchanged economics) |
 | `solve` | `(p::Params; silent=true, tol=1e-8, max_iter=3000, start=nothing, steps=1, base=nothing) -> (sim, status, converged, iterations, elapsed)` | Builds a fresh JuMP model from `p`, solves with Ipopt; `start` warm-starts from a previous `Simulation`, `steps`>1 homotopies from `base` (see above) |
 | `with_shocks` | `(p::Params, overrides::Dict{Symbol,Any}) -> Params` | Deep-copies `p` and applies level overrides |
@@ -180,8 +199,10 @@ is the raw termination status as a string.
 
 The household saving rate, previously a bare literal (`0.09305`) inside the
 `closuremp` constraint, is now `Params.mps0`; the exchange rate, previously a
-module-level scalar, is now `Params.er`. Both are shockable via `with_shocks` like any
-other parameter.
+module-level scalar, is now `Params.er`; the direct-tax rate is `Params.td0` and the
+base tariff revenue `Params.tariff0` (a start value, derived from the data instead of
+the old hardcoded `76.548`). All are shockable via `with_shocks` like any other
+parameter.
 
 ---
 
@@ -204,6 +225,13 @@ comparable tiny amount because they sum those cells (`tariff`, `govsav`) — see
 `test/runtests.jl`'s `skip_cell` for the exact list and the reasoning for each. It also
 runs a reduced (~5-scenario) robustness testset confirming `start`'s warm-start fix on
 the exact cases the original bug report found.
+
+Two further testsets cover the N-sector work: a **generic-workbook round trip** (the Cameroon
+`RawData` written out in the generic layout with its sectors and labour categories reversed, re-read
+through `load_data`'s generic branch, and required to reproduce the legacy calibration and solution
+to 1e-8) and a **synthetic 3-sector / 2-labour dataset** (`test/synthetic_data.jl`) with a base-year
+trade surplus, a government deficit and a 5% direct tax, which calibrates and solves back to its own
+base year.
 
 `test/robustness_grid.jl` (`julia --project=. test/robustness_grid.jl`) is the full
 ~60-scenario grid behind that testset — see its header comment for the shock list and
