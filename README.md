@@ -104,6 +104,14 @@ A worksheet whose `<dimension>` tag under-reports its contents is read correctly
 recomputes the true extent from the cells. (openxlsx, which writes the R-built country databases,
 stamps a placeholder `<dimension ref="A1"/>` on every sheet.)
 
+**Country databases.** The generic workbooks for African economies are built by the R pipeline in
+`~/Documents/Data/CGE` ([AEILabs/CGE-SAMs](https://github.com/AEILabs/CGE-SAMs)) from GTAP Africa
+V3 (2017) and EMERGING V2 (2018): 600 workbooks under `data/<ISO3>_<year>_<family>[_med30]/`
+(families `gtap11afr`, `hybrid` at 61–65 GTAP sectors, `hybrid133` at 89–133 EMERGING sectors, each
+also as a `_mi` labour-share variant, and each at the 30-sector `_med30` scheme), listed with
+caveats in `data/registry.csv`. Those folders are git-ignored here — regenerate them with the
+pipeline's `R/10_export_cge.R`; only `test/data/SEN_2018_hybrid_med30.xlsx` ships with the repo.
+
 ### Units and scale
 
 The model is **unit-free**: pick any currency unit for the whole workbook, keep `pd0 = 1`, and set
@@ -113,10 +121,11 @@ variable's own base level, and Ipopt's four bound/barrier constants
 (`bound_relax_factor`, `bound_push`, `bound_frac`, `mu_init`) are set to values that do not depend
 on the data's magnitude. So a 30-sector database in **billion USD**, whose sector outputs run from
 1e2 down to 1e-4 and whose smallest employment or government-consumption cells sit at 1e-11, solves
-as reliably as Cameroon's billion CFAF: across the 188 such databases under `data/`, cold solves go
-188/188 and 104 of them replicate their base year to ≤1e-6 (the other 84 are limited by a
-savings-investment residual in the data itself, not by the solver). Rescaling a workbook by a
-constant is therefore never necessary and never helps.
+as reliably as Cameroon's billion CFAF: across the 600 country databases under `data/`, cold solves
+go 600/600 and every one replicates its base year to 1e-6 (St Helena at 133 sectors to 3e-5), a
+warm-started tariff shock solving in 597 (validation tables in the pipeline repo's
+`validation/cge_export_check/`). Rescaling a workbook by a constant is therefore never necessary
+and never helps.
 
 ---
 
