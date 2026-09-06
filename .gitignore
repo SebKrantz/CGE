@@ -1,0 +1,4 @@
+.DS_Store
+# databases exported by the Data/CGE pipeline (github.com/AEILabs/CGE-SAMs): regenerate with R/10_export_cge.R
+data/*_20??_*/
+data/registry.csv
